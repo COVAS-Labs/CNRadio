@@ -1,4 +1,4 @@
-# RadioPlugin v1.2 — Simplified, LLM-driven with action hints
+# RadioPlugin v1.3 — Fixed blocking issue in _stop_radio
 import vlc
 import threading
 import time
@@ -168,7 +168,10 @@ class RadioPlugin(PluginBase):
         self.current_station = None
         self.stop_monitor = True
         if self.track_monitor_thread:
-            self.track_monitor_thread.join()
+            # Avoid blocking Covas:NEXT by limiting join wait time
+            # In previous version, join() could block indefinitely if the monitor thread was sleeping
+            # This caused Covas:NEXT to freeze until restart. Using timeout avoids that.
+            self.track_monitor_thread.join(timeout=1)
             self.track_monitor_thread = None
         p_log("INFO", "Stopped radio")
         return "Radio stopped."
