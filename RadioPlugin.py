@@ -1,7 +1,4 @@
-# RadioPlugin v1.4.1 — Added Radio stations:
-# SomaFM Groove Salad
-# GalNET Radio
-
+# RadioPlugin v1.4.5 — Improved NowPlaying support, fallback, and duplicate prevention
 import vlc
 import threading
 import time
@@ -37,7 +34,6 @@ def p_log(level: str, *args):
     except Exception:
         pass
 
-# Event emitted when the radio track changes
 @dataclass
 class RadioChangedEvent(Event):
     station: str
@@ -55,7 +51,6 @@ class RadioChangedEvent(Event):
     def __str__(self) -> str:
         return self.text[0]
 
-# Projection to track current radio state
 class CurrentRadioState(Projection[dict[str, Any]]):
     def get_default_state(self) -> dict[str, Any]:
         return {"station": "", "title": "", "playing": False}
@@ -73,7 +68,6 @@ class CurrentRadioState(Projection[dict[str, Any]]):
             }))
         return projected
 
-# Main plugin class
 class RadioPlugin(PluginBase):
     def __init__(self, plugin_manifest: PluginManifest):
         super().__init__(plugin_manifest, event_classes=[RadioChangedEvent])
@@ -83,7 +77,6 @@ class RadioPlugin(PluginBase):
         self.track_monitor_thread = None
         self.stop_monitor = False
 
-    # Register actions for play, stop, change radio, and set volume
     def register_actions(self, helper: PluginHelper):
         helper.register_action(
             "play_radio",
@@ -132,11 +125,9 @@ class RadioPlugin(PluginBase):
             "global"
         )
 
-    # Register projection for radio state
     def register_projections(self, helper: PluginHelper):
         helper.register_projection(CurrentRadioState())
 
-    # Register status generator to provide context to the LLM
     def register_status_generators(self, helper: PluginHelper):
         helper.register_status_generator(
             lambda states: [(
@@ -146,6 +137,7 @@ class RadioPlugin(PluginBase):
                     "current_station": states.get("CurrentRadioState", {}).get("station", ""),
                     "current_track": states.get("CurrentRadioState", {}).get("title", ""),
                     "is_playing": states.get("CurrentRadioState", {}).get("playing", False),
+                    "description": f"Now playing: {states.get('CurrentRadioState', {}).get('title', 'Unknown')} on {states.get('CurrentRadioState', {}).get('station', 'Unknown')}",
                     "available_actions": {
                         "play_radio": "Play a station",
                         "change_radio": "Change to another station (provide station name)",
@@ -157,13 +149,11 @@ class RadioPlugin(PluginBase):
             )]
         )
 
-    # Stop radio playback when Covas:NEXT shuts down
     def on_chat_stop(self, helper: PluginHelper):
         if self.playing:
             p_log("INFO", "Covas:NEXT stopped. Stopping radio playback.")
             self._stop_radio()
 
-    # Start radio playback
     def _start_radio(self, url, station_name, helper: PluginHelper):
         self._stop_radio()
         if not url:
@@ -178,7 +168,6 @@ class RadioPlugin(PluginBase):
         p_log("INFO", f"Started playing {station_name}")
         return f"Playing {station_name}"
 
-    # Stop radio playback
     def _stop_radio(self):
         if self.player:
             self.player.stop()
@@ -192,24 +181,35 @@ class RadioPlugin(PluginBase):
         p_log("INFO", "Stopped radio")
         return "Radio stopped."
 
-    # Monitor track changes and emit events
     def _monitor_track_changes(self, helper: PluginHelper):
         last_title = ""
         while not self.stop_monitor:
             try:
                 media = self.player.get_media()
-                media.parse()
+                # Force network metadata parsing for better ICY support
+                media.parse_with_options(vlc.MediaParseFlag.network, timeout=5)
+
                 title = media.get_meta(vlc.Meta.Title)
-                if title and title != last_title:
-                    last_title = title
-                    event = RadioChangedEvent(station=self.current_station, title=title)
+                now_playing = media.get_meta(vlc.Meta.NowPlaying)
+
+                # Debug log to check what VLC returns
+                p_log("DEBUG", f"Metadata check: Title={title}, NowPlaying={now_playing}")
+
+                # Prefer NowPlaying, then Title, else fallback
+                display_title = now_playing or title or f"{self.current_station} - Unknown track"
+
+                # Normalize for comparison to avoid duplicates
+                normalized_title = display_title.strip().lower()
+
+                if normalized_title and normalized_title != last_title:
+                    last_title = normalized_title
+                    event = RadioChangedEvent(station=self.current_station, title=display_title)
                     helper.put_incoming_event(event)
-                    p_log("INFO", f"Track changed: {title}")
+                    p_log("INFO", f"Track changed: {display_title}")
             except Exception as e:
                 p_log("ERROR", f"Track monitor error: {e}")
             time.sleep(10)
 
-    # Set volume of the radio player
     def _set_volume(self, volume: int):
         if self.player:
             self.player.audio_set_volume(volume)
