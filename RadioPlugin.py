@@ -1,4 +1,7 @@
-# RadioPlugin v1.4 — Added volume control via set_volume
+# RadioPlugin v1.4.1 — Added Radio stations:
+# SomaFM Groove Salad
+# GalNET Radio
+
 import vlc
 import threading
 import time
@@ -15,7 +18,9 @@ from lib.Logger import log
 RADIO_STATIONS = {
     "Radio Sidewinder": "https://radiosidewinder.out.airtime.pro:8000/radiosidewinder_b",
     "Hutton Orbital Radio": "https://quincy.torontocast.com/hutton",
-    "SomaFM DeepspaceOne": "https://ice.somafm.com/deepspaceone"
+    "SomaFM Deep Space One": "https://ice.somafm.com/deepspaceone",
+    "SomaFM Groove Salad": "https://ice.somafm.com/groovesalad",
+    "GalNET Radio": "http://listen.radionomy.com/galnet"
 }
 
 # Logging configuration
