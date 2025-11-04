@@ -1,4 +1,4 @@
-# RadioPlugin v1.3 — Fixed blocking issue in _stop_radio
+# RadioPlugin v1.4 — Added volume control via set_volume
 import vlc
 import threading
 import time
@@ -13,7 +13,7 @@ from lib.Logger import log
 
 # Pre-installed radio stations
 RADIO_STATIONS = {
-    "Radio Sidewinder": "https://radiosidewinder.out.airtime.pro:8000/radiosidewinder_b?...",
+    "Radio Sidewinder": "https://radiosidewinder.out.airtime.pro:8000/radiosidewinder_b",
     "Hutton Orbital Radio": "https://quincy.torontocast.com/hutton",
     "SomaFM DeepspaceOne": "https://ice.somafm.com/deepspaceone"
 }
@@ -78,7 +78,7 @@ class RadioPlugin(PluginBase):
         self.track_monitor_thread = None
         self.stop_monitor = False
 
-    # Register actions for play, stop, and change radio
+    # Register actions for play, stop, change radio, and set volume
     def register_actions(self, helper: PluginHelper):
         helper.register_action(
             "play_radio",
@@ -113,6 +113,19 @@ class RadioPlugin(PluginBase):
             lambda args, states: self._start_radio(RADIO_STATIONS.get(args["station"]), args["station"], helper),
             "global"
         )
+        helper.register_action(
+            "set_volume",
+            "Set the volume of the radio",
+            {
+                "type": "object",
+                "properties": {
+                    "volume": {"type": "integer", "minimum": 0, "maximum": 100}
+                },
+                "required": ["volume"]
+            },
+            lambda args, states: self._set_volume(args["volume"]),
+            "global"
+        )
 
     # Register projection for radio state
     def register_projections(self, helper: PluginHelper):
@@ -131,7 +144,8 @@ class RadioPlugin(PluginBase):
                     "available_actions": {
                         "play_radio": "Play a station",
                         "change_radio": "Change to another station (provide station name)",
-                        "stop_radio": "Stop the radio"
+                        "stop_radio": "Stop the radio",
+                        "set_volume": "Set the volume (0–100)"
                     },
                     "hint": "To change station, use change_radio with parameter station."
                 }
@@ -168,9 +182,6 @@ class RadioPlugin(PluginBase):
         self.current_station = None
         self.stop_monitor = True
         if self.track_monitor_thread:
-            # Avoid blocking Covas:NEXT by limiting join wait time
-            # In previous version, join() could block indefinitely if the monitor thread was sleeping
-            # This caused Covas:NEXT to freeze until restart. Using timeout avoids that.
             self.track_monitor_thread.join(timeout=1)
             self.track_monitor_thread = None
         p_log("INFO", "Stopped radio")
@@ -192,3 +203,12 @@ class RadioPlugin(PluginBase):
             except Exception as e:
                 p_log("ERROR", f"Track monitor error: {e}")
             time.sleep(10)
+
+    # Set volume of the radio player
+    def _set_volume(self, volume: int):
+        if self.player:
+            self.player.audio_set_volume(volume)
+            p_log("INFO", f"Volume set to {volume}")
+            return f"Volume set to {volume}"
+        else:
+            return "No active player to set volume."

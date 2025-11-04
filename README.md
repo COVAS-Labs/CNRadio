@@ -9,7 +9,7 @@ It supports voice commands for starting, stopping, and switching stations, and c
 ## 📡 Supported Stations
 
 - **Radio Sidewinder**  
-  `https://radiosidewinder.out.airtime.pro:8000/radiosidewinder_b?...`
+  `https://radiosidewinder.out.airtime.pro:8000/radiosidewinder_b`
 - **Hutton Orbital Radio**  
   `https://quincy.torontocast.com/hutton`
 - **SomaFM DeepspaceOne**  
