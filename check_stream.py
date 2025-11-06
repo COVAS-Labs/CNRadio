@@ -3,7 +3,7 @@ import time
 
 # Stream URL to monitor
 # stream_url = "http://ice1.somafm.com/secretagent-128-mp3"
-stream_url = "http://ice1.somafm.com/secretagent-128-mp3"
+stream_url = "https://ice1.somafm.com/deepspaceone-128-mp3"
 # Create VLC media player
 player = vlc.MediaPlayer(stream_url)
 player.play()
