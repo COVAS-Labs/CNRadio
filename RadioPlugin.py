@@ -1,7 +1,13 @@
-# RadioPlugin v2.2.0
+# RadioPlugin v2.2.1
 # -------------------
 # Stable release for Covas:NEXT
 # - SomaFM station support with accurate track retrieval via JSON API
+# - Added SomaFM stations to pre-installed list
+# - Fixed thread management to prevent duplicate track change events
+# - Improved thread termination when changing stations
+# - Added more frequent stop flag checks in monitor thread
+# - Made monitor threads daemon to prevent app hanging
+# - Enhanced logging for better thread lifecycle tracking
 
 import vlc
 import threading
@@ -48,6 +54,14 @@ RADIO_STATIONS = {
     "SomaFM Secret Agent": {
         "url": "https://ice.somafm.com/secretagent",
         "description": "Spy-themed lounge and downtempo music for covert operations."
+    },
+    "SomaFM Defcon": {
+        "url": "https://ice.somafm.com/defcon",
+        "description": "Dark ambient and industrial music for intense situations."
+    },
+    "SomaFM Lush": {
+        "url": "https://ice.somafm.com/lush",
+        "description": "Ambient and ethereal soundscapes for serene journeys."
     },
     "GalNET Radio": {
         "url": "http://listen.radionomy.com/galnet",
@@ -270,11 +284,16 @@ class RadioPlugin(PluginBase):
             self._stop_radio()
 
     def _start_radio(self, url, station_name, helper: PluginHelper):
+        # Ensure proper cleanup of previous radio session
         self._stop_radio()
+    
         if not url:
             p_log("ERROR", f"URL for station {station_name} not found.")
             return f"URL for station {station_name} not found."
         try:
+            # Wait a moment to ensure previous thread is fully terminated
+            time.sleep(0.5)
+        
             self.player = vlc.MediaPlayer(url)
             self.player.play()
             default_volume = helper.get_plugin_setting('RadioPlugin', 'general', 'default_volume') or DEFAULT_VOLUME
@@ -283,8 +302,12 @@ class RadioPlugin(PluginBase):
             self.current_station = station_name
             self.playing = True
             self.stop_monitor = False
+        
+            # Create and start a new monitor thread
             self.track_monitor_thread = threading.Thread(target=self._monitor_track_changes, args=(helper,))
+            self.track_monitor_thread.daemon = True  # Make thread daemon so it exits when main thread exits
             self.track_monitor_thread.start()
+        
             p_log("INFO", f"Started playing {station_name} at volume {default_volume}")
             return f"Playing {station_name} at volume {default_volume}"
         except Exception as e:
@@ -293,21 +316,28 @@ class RadioPlugin(PluginBase):
 
     def _stop_radio(self):
         try:
+            # Set flag to stop monitoring thread
+            self.stop_monitor = True
+        
+            # Stop player if it exists
             if self.player:
                 self.player.stop()
                 self.player = None
+            
             self.playing = False
             self.current_station = None
-            self.stop_monitor = True
-            if self.track_monitor_thread:
-                self.track_monitor_thread.join(timeout=1)
+        
+            # Wait for thread to terminate with timeout
+            if self.track_monitor_thread and self.track_monitor_thread.is_alive():
+                self.track_monitor_thread.join(timeout=2)
+                # Force reference cleanup even if thread didn't terminate properly
                 self.track_monitor_thread = None
+            
             p_log("INFO", "Stopped radio")
             return "Radio stopped."
         except Exception as e:
             p_log("ERROR", f"Error stopping radio: {e}")
             return f"Error stopping radio: {e}"
-
     def _set_volume(self, volume: int):
         """Set the playback volume safely, even during stream startup."""
         try:
@@ -342,52 +372,66 @@ class RadioPlugin(PluginBase):
         last_title = ""
         last_event_time = 0
 
-        p_log("INFO", "Track monitor started.")
+        p_log("INFO", f"Track monitor started for {self.current_station}.")
+    
         while not self.stop_monitor:
             try:
-                if not self.player:
-                    time.sleep(2)
+                if not self.player or self.stop_monitor:
+                    time.sleep(1)  # Check more frequently if we should stop
                     continue
 
                 # Get track info based on station type
                 display_title = ""
-            
+        
                 # Check if this is a SomaFM station
                 is_somafm = any(name in self.current_station.lower() for name in ["somafm", "soma.fm", "deepspaceone", "groovesalad", "spacestation", "secretagent"])
-            
+        
                 if is_somafm:
                     # Use the specialized SomaFM track retriever
                     p_log("DEBUG", f"Using SomaFM track retriever for {self.current_station}")
                     display_title = somaretriever.get_somafm_track_info(self.current_station)
-            
+        
                 # If we couldn't get info from SomaFM API or it's not a SomaFM station,
                 # fall back to VLC metadata
                 if not display_title:
                     media = self.player.get_media()
                     if not media:
-                        time.sleep(2)
+                        time.sleep(1)  # Check more frequently
                         continue
 
                     title = media.get_meta(vlc.Meta.Title)
                     now_playing = media.get_meta(vlc.Meta.NowPlaying)
                     display_title = now_playing or title or ""
-            
+        
                 normalized_title = display_title.strip().lower()
 
                 if not normalized_title:
-                    time.sleep(5)
+                    # Check stop flag more frequently
+                    for _ in range(5):
+                        if self.stop_monitor:
+                            break
+                        time.sleep(1)
                     continue
 
                 current_time = time.time()
                 if normalized_title != last_title and (current_time - last_event_time > 5):
                     last_title = normalized_title
                     last_event_time = current_time
-                    event = RadioChangedEvent(station=self.current_station, title=display_title)
-                    p_log("INFO", f"Track changed -> {display_title}")
-                    helper.put_incoming_event(event)
+                
+                    # Only create event if we're still playing the same station
+                    if not self.stop_monitor:
+                        event = RadioChangedEvent(station=self.current_station, title=display_title)
+                        p_log("INFO", f"Track changed -> {display_title}")
+                        helper.put_incoming_event(event)
 
-                time.sleep(10)
+                # Check stop flag more frequently with shorter sleep intervals
+                for _ in range(10):
+                    if self.stop_monitor:
+                        break
+                    time.sleep(1)
 
             except Exception as e:
                 p_log("ERROR", f"Track monitor error: {e}")
-                time.sleep(10)
+                time.sleep(5)
+    
+        p_log("INFO", f"Track monitor stopped for {self.current_station}.")
