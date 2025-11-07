@@ -63,6 +63,10 @@ RADIO_STATIONS = {
         "url": "https://ice.somafm.com/lush",
         "description": "Ambient and ethereal soundscapes for serene journeys."
     },
+        "SomaFM Synphaera": {
+        "url": "https://ice.somafm.com/synphaera",
+        "description": "Cinematic and ambient music for epic space adventures."
+    },
     "GalNET Radio": {
         "url": "http://listen.radionomy.com/galnet",
         "description": "Sci-fi themed station with ambient, rock, and classical music, plus GalNet news."
@@ -270,8 +274,7 @@ class RadioPlugin(PluginBase):
             dj_style = helper.get_plugin_setting('RadioPlugin', 'general', 'dj_response_style') or DEFAULT_DJ_STYLE
             return [{
                 "role": "user",
-                "content": f"IMPORTANT: React to this radio track change. "
-                           f"New track: '{event.title}' on station '{event.station}'. {dj_style}"
+                "content": f"IMPORTANT: React to this radio track change. New track: '{event.title}' on station '{event.station}'. {dj_style}"
             }]
         return []
 
