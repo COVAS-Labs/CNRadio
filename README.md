@@ -79,6 +79,10 @@ The plugin responds to natural commands like:
 
 1. Copy the plugin folder into `%APPDATA%/com.covas-next.ui/plugins/` directory.
 2. Ensure `python_vlc` and `vlc.py` are present in `deps/` or installed globally.
+
+You can install them using command, inside the plugin folder:
+
+`pip install -r requirements.txt --target=./deps --upgrade`
 3. Install **VLC media player**.
 4. Restart **Covas:NEXT** and enable the plugin from the *Plugins* interface.
 
