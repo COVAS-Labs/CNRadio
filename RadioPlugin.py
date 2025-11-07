@@ -63,6 +63,10 @@ RADIO_STATIONS = {
         "url": "https://ice.somafm.com/lush",
         "description": "Ambient and ethereal soundscapes for serene journeys."
     },
+        "SomaFM Synphaera": {
+        "url": "https://ice.somafm.com/synphaera",
+        "description": "Cinematic and ambient music for epic space adventures."
+    },
     "GalNET Radio": {
         "url": "http://listen.radionomy.com/galnet",
         "description": "Sci-fi themed station with ambient, rock, and classical music, plus GalNet news."
