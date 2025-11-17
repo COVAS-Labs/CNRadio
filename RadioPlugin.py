@@ -1,13 +1,16 @@
-# RadioPlugin v2.2.1
+# RadioPlugin v3.0.2
 # -------------------
-# Stable release for Covas:NEXT
-# - SomaFM station support with accurate track retrieval via JSON API
-# - Added SomaFM stations to pre-installed list
-# - Fixed thread management to prevent duplicate track change events
-# - Improved thread termination when changing stations
-# - Added more frequent stop flag checks in monitor thread
-# - Made monitor threads daemon to prevent app hanging
-# - Enhanced logging for better thread lifecycle tracking
+# Major update for Covas:NEXT compatibility
+# - Refactored to use new PluginBase and PluginHelper APIs
+# - Converted RadioChangedEvent to PluginEvent
+# - Implemented new event registration system
+# - Improved thread management and error handling
+# - Enhanced track change detection for SomaFM stations
+# - Added more robust volume control
+# Updated to use new event system
+# - Removed custom RadioChangedEvent class
+# - Using PluginEvent from lib.PluginHelper
+# - Simplified event handling
 
 import vlc
 import threading
@@ -15,12 +18,9 @@ import time
 from . import somafm_track_retriever as somaretriever
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Literal
-from openai.types.chat import ChatCompletionMessageParam
-from lib.PluginBase import PluginBase
-from lib.PluginHelper import PluginHelper, PluginManifest
-from lib.Event import Event, ProjectedEvent
-from lib.EventManager import Projection
+from typing import Any, Literal, Callable
+from lib.PluginBase import PluginBase, PluginManifest
+from lib.PluginHelper import PluginHelper, PluginEvent
 from lib.Logger import log
 from lib.PluginSettingDefinitions import (
     PluginSettings, SettingsGrid, SelectOption, TextAreaSetting, TextSetting,
@@ -63,7 +63,7 @@ RADIO_STATIONS = {
         "url": "https://ice.somafm.com/lush",
         "description": "Ambient and ethereal soundscapes for serene journeys."
     },
-        "SomaFM Synphaera": {
+    "SomaFM Synphaera": {
         "url": "https://ice.somafm.com/synphaera",
         "description": "Cinematic and ambient music for epic space adventures."
     },
@@ -73,7 +73,7 @@ RADIO_STATIONS = {
     }
 }
 
-PLUGIN_LOG_LEVEL = "INFO"
+PLUGIN_LOG_LEVEL = "ERROR"
 _LEVELS = {"DEBUG": 10, "INFO": 20, "ERROR": 40}
 DEFAULT_VOLUME = 55
 DEFAULT_DJ_STYLE = "Speak like a DJ or make a witty comment"
@@ -92,52 +92,12 @@ def p_log(level: str, *args):
         log("ERROR", "[RadioPlugin] Logging failure:", e)
 
 # ---------------------------------------------------------------------
-# Event and Projection
-# ---------------------------------------------------------------------
-@dataclass
-class RadioChangedEvent(Event):
-    """Event triggered when VLC metadata changes track."""
-    station: str
-    title: str = ""
-    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    kind: Literal['tool'] = 'tool'
-    text: list[str] = field(default_factory=list)
-    processed_at: float = 0.0
-    memorized_at: str = None
-    responded_at: str = None
-
-    def __post_init__(self):
-        self.text = [f"Radio changed to {self.station}: {self.title}"]
-
-    def __str__(self) -> str:
-        return self.text[0]
-
-
-class CurrentRadioState(Projection[dict[str, Any]]):
-    """Projection maintaining the current radio state."""
-    def get_default_state(self) -> dict[str, Any]:
-        return {"station": "", "title": "", "playing": False}
-
-    def process(self, event: Event) -> list[ProjectedEvent]:
-        projected = []
-        if isinstance(event, RadioChangedEvent):
-            self.state["station"] = event.station
-            self.state["title"] = event.title
-            self.state["playing"] = True
-            projected.append(ProjectedEvent({
-                "event": "RadioChanged",
-                "station": event.station,
-                "title": event.title
-            }))
-        return projected
-
-# ---------------------------------------------------------------------
 # Main plugin class
 # ---------------------------------------------------------------------
 class RadioPlugin(PluginBase):
     """Main Radio Plugin for Covas:NEXT."""
     def __init__(self, plugin_manifest: PluginManifest):
-        super().__init__(plugin_manifest, event_classes=[RadioChangedEvent])
+        super().__init__(plugin_manifest)
         self.current_station = None
         self.player = None
         self.playing = False
@@ -201,9 +161,93 @@ class RadioPlugin(PluginBase):
         html += "</ul>"
         return html
 
-    def on_plugin_helper_ready(self, helper: PluginHelper):
-        self.register_should_reply_handlers(helper)
-        self.register_prompt_handlers(helper)
+    def on_chat_start(self, helper: PluginHelper):
+        """Initialize plugin when chat starts."""
+        # Register actions
+        self.register_actions(helper)
+        
+        # Register the radio_changed event
+        helper.register_event(
+            name="radio_changed",
+            should_reply_check=lambda event: self._should_reply_to_radio_event(event),
+            prompt_generator=lambda event: self._generate_radio_prompt(event)
+        )
+        
+        p_log("INFO", "RadioPlugin initialized successfully")
+
+    # -----------------------------------------------------------------
+    # Event handling
+    # -----------------------------------------------------------------
+    def _should_reply_to_radio_event(self, event: PluginEvent) -> bool:
+        """Decide whether Covas should reply to a radio track change."""
+        try:
+            content = event.plugin_event_content
+            title = content[0]
+            station = content[1]
+            command_triggered = content[2] if len (content) > 2 else False
+            if len(event.plugin_event_content) > 2:
+                command_triggered = event.plugin_event_content[2]
+        except (ValueError, TypeError):
+            p_log("ERROR", f"Invalid plugin_event_content format: {event.plugin_event_content}")
+            return False
+        # Skip empty or invalid titles
+        if not title or "unknown" in title.lower() or len(title.strip()) <3 :
+            p_log("DEBUG", f"Ignoring empty or invalid title")
+            return False
+        
+        normalized_title = title.strip().lower()
+        last_title_norm = (self._last_replied_title or "").strip().lower()
+        last_station = getattr(self, "_last_replied_station", None)
+        current_time = time.time()
+        # Initialize repeat counter if doesn't exists
+        if not hasattr(self, "_title_repeat_count"):
+            self._title_repeat_count ={}
+        
+        # Create a unque key for the title+station combo
+        track_key = f"{normalized_title}|{station}"
+
+        # If same station and same title recently, skip
+        if normalized_title == last_title_norm and station == last_station:
+            if current_time - self._last_reply_time < 45:  # 45s cooldown for same song
+                p_log("DEBUG", f"Duplicate '{title}' on same station ignored (within 45s).")
+                return False
+            else:
+                p_log("DEBUG", f"Same title on same station but cooldown passed, checking trigger.")
+        # If cooldown passed but not triggered by a command with counter > 0, ignore
+        if not command_triggered:
+            #Counter +1
+            self._title_repeat_count[track_key] = self._title_repeat_count.get(track_key, 0) + 1
+            if self._title_repeat_count[track_key] > 1:
+                p_log("DEBUG", f"Same title repeated {self._title_repeat_count[track_key]} times, ignoring")
+                return False
+            else:
+                p_log("DEBUG", f"First repeat of '{title}' after cooldown, allowing reply.")
+        else:
+            #New title or new station, reset counter
+            self._title_repeat_count[track_key] = 0
+
+        # Update memory
+        self._last_replied_title = title
+        self._last_replied_station = station
+        self._last_reply_time = current_time
+
+        p_log("DEBUG", f"Will reply to '{title}' on {station}")
+        return True
+
+    def _generate_radio_prompt(self, event: PluginEvent) -> str:
+        """Generate prompt for radio track change events."""
+        try:
+            content = event.plugin_event_content
+            if isinstance(content, list) and len(content) >= 2:
+                title = content[0]
+                station = content[1]
+            else:
+                raise ValueError(f"Expected list with at least 2 elements, got: {content}")
+        except (ValueError, TypeError) as e:
+            p_log("ERROR", f"Invalid plugin_event_content format in prompt generator: {event.plugin_event_content}")
+            return "IMPORTANT: React to this radio track change. The track information could not be retrieved."
+        dj_style = self.settings.get('dj_response_style', DEFAULT_DJ_STYLE)
+        return f"IMPORTANT: React to this radio track change. New track: '{title}' on station '{station}'. {dj_style}"
 
     # -----------------------------------------------------------------
     # Action registration
@@ -230,55 +274,6 @@ class RadioPlugin(PluginBase):
         )
 
     # -----------------------------------------------------------------
-    # Reply and prompt logic
-    # -----------------------------------------------------------------
-    def register_should_reply_handlers(self, helper: PluginHelper):
-        helper.register_should_reply_handler(lambda event, projected_states: self.radio_should_reply_handler(helper, event, projected_states))
-
-    def radio_should_reply_handler(self, helper: PluginHelper, event: Event, projected_states: dict[str, dict]) -> bool | None:
-        """Decide whether Covas should reply to a radio track change."""
-        if not isinstance(event, RadioChangedEvent):
-            return None
-
-        # Skip empty or invalid titles
-        if not event.title or "unknown" in event.title.lower() or len(event.title.strip()) < 3:
-            p_log("DEBUG", f"RADIOPLUGIN: Ignoring empty or invalid title '{event.title}'")
-            return False
-
-        normalized_title = event.title.strip().lower()
-        last_title_norm = (self._last_replied_title or "").strip().lower()
-        last_station = getattr(self, "_last_replied_station", None)
-        current_time = time.time()
-
-        # If same station and same title recently, skip
-        if normalized_title == last_title_norm and event.station == last_station:
-            if current_time - self._last_reply_time < 45:  # 45s cooldown for same song
-                p_log("DEBUG", f"RADIOPLUGIN: Duplicate '{event.title}' on same station ignored (within 45s).")
-                return False
-            else:
-                log("DEBUG", f"RADIOPLUGIN: Same title on same station but cooldown passed, allowing reply.")
-
-        # Update memory
-        self._last_replied_title = event.title
-        self._last_replied_station = event.station
-        self._last_reply_time = current_time
-
-        p_log("DEBUG", f"RADIOPLUGIN: Will reply to '{event.title}' on {event.station}")
-        return True
-
-    def register_prompt_handlers(self, helper: PluginHelper):
-        helper.register_prompt_event_handler(lambda event: self.new_radio_event_prompt_handler(event, helper))
-
-    def new_radio_event_prompt_handler(self, event: Event, helper: PluginHelper) -> list[ChatCompletionMessageParam]:
-        if isinstance(event, RadioChangedEvent):
-            dj_style = helper.get_plugin_setting('RadioPlugin', 'general', 'dj_response_style') or DEFAULT_DJ_STYLE
-            return [{
-                "role": "user",
-                "content": f"IMPORTANT: React to this radio track change. New track: '{event.title}' on station '{event.station}'. {dj_style}"
-            }]
-        return []
-
-    # -----------------------------------------------------------------
     # Player control
     # -----------------------------------------------------------------
     def on_chat_stop(self, helper: PluginHelper):
@@ -299,13 +294,15 @@ class RadioPlugin(PluginBase):
         
             self.player = vlc.MediaPlayer(url)
             self.player.play()
-            default_volume = helper.get_plugin_setting('RadioPlugin', 'general', 'default_volume') or DEFAULT_VOLUME
+            default_volume = self.settings.get('default_volume', DEFAULT_VOLUME)
             self.player.audio_set_volume(default_volume)
 
             self.current_station = station_name
             self.playing = True
             self.stop_monitor = False
-        
+            # We had started the radio
+            self.command_triggered = True
+
             # Create and start a new monitor thread
             self.track_monitor_thread = threading.Thread(target=self._monitor_track_changes, args=(helper,))
             self.track_monitor_thread.daemon = True  # Make thread daemon so it exits when main thread exits
@@ -329,6 +326,7 @@ class RadioPlugin(PluginBase):
             
             self.playing = False
             self.current_station = None
+            self.command_triggered = False
         
             # Wait for thread to terminate with timeout
             if self.track_monitor_thread and self.track_monitor_thread.is_alive():
@@ -341,11 +339,12 @@ class RadioPlugin(PluginBase):
         except Exception as e:
             p_log("ERROR", f"Error stopping radio: {e}")
             return f"Error stopping radio: {e}"
+
     def _set_volume(self, volume: int):
         """Set the playback volume safely, even during stream startup."""
         try:
             if not self.player:
-                p_log("ERROR", "RADIOPLUGIN: No active player to set volume.")
+                p_log("ERROR", "No active player to set volume.")
                 return "No active player to set volume."
 
             volume = max(0, min(100, int(volume)))
@@ -356,24 +355,27 @@ class RadioPlugin(PluginBase):
                 result = self.player.audio_set_volume(volume)
 
             if result == -1:
-                p_log("ERROR", "RADIOPLUGIN: VLC refused volume change (player not ready).")
+                p_log("ERROR", "VLC refused volume change (player not ready).")
                 return "Unable to set volume right now."
 
             actual = self.player.audio_get_volume()
-            p_log("INFO", f"RADIOPLUGIN: Volume set to {actual} (requested {volume})")
+            p_log("INFO", f"Volume set to {actual} (requested {volume})")
             return f"Volume set to {actual}"
 
         except Exception as e:
-            p_log("ERROR", f"RADIOPLUGIN: Error setting volume: {e}")
+            p_log("ERROR", f"Error setting volume: {e}")
             return f"Error setting volume: {e}"
 
     # -----------------------------------------------------------------
-    # Track monitoring (debounced)
+    # Track monitoring
     # -----------------------------------------------------------------
     def _monitor_track_changes(self, helper: PluginHelper):
         """Monitor VLC metadata and trigger an event when the track actually changes."""
         last_title = ""
         last_event_time = 0
+        last_check_time = 0
+        check_interval = 5
+        command_triggered = getattr(self, "command_triggered", False)
 
         p_log("INFO", f"Track monitor started for {self.current_station}.")
     
@@ -382,18 +384,23 @@ class RadioPlugin(PluginBase):
                 if not self.player or self.stop_monitor:
                     time.sleep(1)  # Check more frequently if we should stop
                     continue
+                current_time = time.time()
+                if current_time - last_check_time < check_interval:
+                    time.sleep(1)
+                    continue
+                last_check_time = current_time
 
                 # Get track info based on station type
                 display_title = ""
-        
+    
                 # Check if this is a SomaFM station
                 is_somafm = any(name in self.current_station.lower() for name in ["somafm", "soma.fm", "deepspaceone", "groovesalad", "spacestation", "secretagent"])
-        
+    
                 if is_somafm:
                     # Use the specialized SomaFM track retriever
                     p_log("DEBUG", f"Using SomaFM track retriever for {self.current_station}")
                     display_title = somaretriever.get_somafm_track_info(self.current_station)
-        
+    
                 # If we couldn't get info from SomaFM API or it's not a SomaFM station,
                 # fall back to VLC metadata
                 if not display_title:
@@ -405,7 +412,7 @@ class RadioPlugin(PluginBase):
                     title = media.get_meta(vlc.Meta.Title)
                     now_playing = media.get_meta(vlc.Meta.NowPlaying)
                     display_title = now_playing or title or ""
-        
+    
                 normalized_title = display_title.strip().lower()
 
                 if not normalized_title:
@@ -416,23 +423,25 @@ class RadioPlugin(PluginBase):
                         time.sleep(1)
                     continue
 
-                current_time = time.time()
-                if normalized_title != last_title and (current_time - last_event_time > 5):
+                if normalized_title != last_title and (current_time - last_event_time > 5) or command_triggered:
                     last_title = normalized_title
                     last_event_time = current_time
-                
-                    # Only create event if we're still playing the same station
+            
+                   # Only create event if we're still playing the same station
                     if not self.stop_monitor:
-                        event = RadioChangedEvent(station=self.current_station, title=display_title)
-                        p_log("INFO", f"Track changed -> {display_title}")
-                        helper.put_incoming_event(event)
-
-                # Check stop flag more frequently with shorter sleep intervals
-                for _ in range(10):
-                    if self.stop_monitor:
-                        break
-                    time.sleep(1)
-
+                        try:
+                            event = PluginEvent(
+                                kind="plugin",
+                                plugin_event_name="radio_changed",
+                                plugin_event_content=[display_title, self.current_station, command_triggered]
+                            )                    
+                            p_log("INFO", f"Track changed -> {display_title} (command triggered: {command_triggered})")
+                            helper.dispatch_event(event)
+                            p_log("DEBUG", "Event dispatched successfully")
+                            command_triggered = False
+                        except Exception as e:
+                            p_log("ERROR", f"Error creating or dispatching event: {e}")
+                time.sleep(5)
             except Exception as e:
                 p_log("ERROR", f"Track monitor error: {e}")
                 time.sleep(5)
