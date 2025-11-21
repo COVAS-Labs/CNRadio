@@ -76,7 +76,7 @@ RADIO_STATIONS = {
     }
 }
 
-PLUGIN_LOG_LEVEL = "DEBUG"
+PLUGIN_LOG_LEVEL = "ERROR"
 _LEVELS = {"DEBUG": 10, "INFO": 20, "ERROR": 40}
 DEFAULT_VOLUME = 55
 DEFAULT_DJ_STYLE = "Speak like a DJ or make a witty comment"
