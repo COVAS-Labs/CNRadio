@@ -1,5 +1,4 @@
-# RadioPlugin for Covas:NEXT – Release 2.1.0
-
+# RadioPlugin for Covas:NEXT
 ## 📦 Overview
 
 **RadioPlugin** is an extension for **Covas:NEXT** that allows you to listen to and control webradio stations directly from the assistant interface.  
