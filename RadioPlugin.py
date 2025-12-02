@@ -416,6 +416,7 @@ class RadioPlugin(PluginBase):
         last_title = ""
         last_event_time = 0
         last_check_time = 0
+        checks_without_change = 0  # Counter: how many checks returned the same title
         # Define check intervals
         default_check_interval = 5  # 5 seconds for regular stations
         somafm_check_interval = 20  # Longer interval for SomaFM stations
@@ -425,12 +426,12 @@ class RadioPlugin(PluginBase):
         prev_station = self.current_station
         is_somafm = self.is_somafm_station(prev_station) if prev_station else False
         is_hutton = "hutton" in (prev_station or "").lower()
-        # monitoring phase: start 'initial' to announce immediately, then move to 'followup' to reduce checks
+        # monitoring phase: start 'initial' to announce immediately, then move to 'reduced' after 2 checks without change
         phase = 'initial'
         immediate_check = False
         check_interval = somafm_check_interval if is_somafm else default_check_interval
 
-        p_log("INFO", f"Track monitor started for {prev_station}. Phase={phase} (SomaFM: {is_somafm}, Hutton: {is_hutton})")
+        p_log("INFO", f"Track monitor started for {prev_station}. StartupSequence=True step=1 (SomaFM: {is_somafm}, Hutton: {is_hutton})")
     
         while not self.stop_monitor:
             try:
@@ -458,6 +459,7 @@ class RadioPlugin(PluginBase):
                     last_event_time = 0
                     last_check_time = 0
                     phase = 'initial'
+                    checks_without_change = 0  # Reset counter on station change
 
                 # Compute intervals based on station type and current phase
                 if is_somafm or is_hutton:
@@ -503,6 +505,7 @@ class RadioPlugin(PluginBase):
                     p_log("DEBUG", f"New track detected: '{display_title}' (previous: '{last_title}')")
                     last_title = normalized_title
                     last_event_time = current_time
+                    checks_without_change = 0  # Reset counter when track DOES change
             
                    # Only create event if we're still playing the same station
                     if not self.stop_monitor:
@@ -515,8 +518,8 @@ class RadioPlugin(PluginBase):
                             p_log("INFO", f"Track changed -> {display_title} (command triggered: {command_triggered})")
                             helper.dispatch_event(event)
                             p_log("DEBUG", "Event dispatched successfully")
-                            # After announcing a new track, keep the monitor on the longer initial interval
-                            # so we avoid aggressive polling immediately after an announcement.
+                            # After announcing a new track, reset to initial interval to ensure stable detection.
+                            # Phase will drop to 'reduced' after 2 more checks without track change.
                             phase = 'initial'
                             command_triggered = False
                             # Ensure we use the initial (longer) interval for the next check cycle
@@ -527,9 +530,17 @@ class RadioPlugin(PluginBase):
                             # Record the last check time so the loop waits the full initial interval
                             last_check_time = current_time
                             # Do not request an immediate follow-up check; wait the long interval instead
-                            p_log("DEBUG", f"Announced track; resetting to initial interval (check_interval={check_interval})")
+                            p_log("DEBUG", f"Announced track; resetting to initial interval (check_interval={check_interval}s)")
                         except Exception as e:
                             p_log("ERROR", f"Error creating or dispatching event: {e}")
+                else:
+                    # Track did NOT change - increment counter
+                    checks_without_change += 1
+                    # After 2 checks of same track, switch to reduced interval for efficiency
+                    if checks_without_change >= 2 and phase == 'initial':
+                        phase = 'reduced'
+                        p_log("DEBUG", f"Same track for {checks_without_change} checks -> switching to reduced interval (phase=reduced)")
+
                 # Use the calculated check interval unless an immediate check was requested
                 if immediate_check:
                     immediate_check = False
