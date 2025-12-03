@@ -1,40 +1,78 @@
-# RadioPlugin v3.2.0
+# RadioPlugin v3.3.0
 # -------------------
-# Changed Hutton Orbital URL to the "firewall-friendly" one
-# Enhanced monitoring and retriever management
-# - Implemented dynamic check intervals (initial vs. followup phases)
-# - Fixed retriever stickiness: station type re-evaluated on each monitoring cycle
-# - Ensured correct retriever selection (SomaFM/Hutton) after station changes
-# - Aligned Hutton Orbital Radio with SomaFM timing (120s initial, 20s reduced)
-# - After track announcement, maintain long initial interval to avoid aggressive polling
-# - Added debug logging for interval decisions and station monitoring state
-# - Improved track change event payload to use current_station consistently
+# Release 3.3.0 - Dec 2025
+# Key improvements in this release:
+# - Implemented lazy/active monitoring mode: startup announces immediately, then enters
+#   lazy mode (120s checks for SomaFM/Hutton, 90s for others). After 2 unchanged lazy
+#   checks, switches to active mode (30s checks for SomaFM/Hutton, 15s for others) until
+#   a track change is detected, then returns to lazy mode.
+# - Consolidated interval initialization: initial_interval and reduced_interval computed
+#   once at startup and re-evaluated only on station changes (improved efficiency).
+# - Added an 8s delay after user-triggered play/change so the assistant can respond
+#   before the monitor announces the current track.
+# - Suppress duplicate automatic announcements: if the normalized title matches the
+#   last announced title on the same station, automatic announcements are suppressed
+#   (explicit user commands still force a reply).
+# - Robust title normalization using Unicode NFKC + `casefold()` to avoid false
+#   positives from case or Unicode variants.
+# - Added `RadioPlaybackProjection` to persist current station/title in projections
+#   so Covas:NEXT can remember what's playing across sessions.
+# - Improved debug logging and fixed several edge-cases in the startup/check flow.
 #
-# Previous versions (v3.1.0 and earlier)
-# - Major update for Covas:NEXT compatibility
-# - Refactored to use new PluginBase and PluginHelper APIs
-# - Converted RadioChangedEvent to PluginEvent
-# - Implemented new event registration system
-# - Improved thread management and error handling
-# - Enhanced track change detection for SomaFM stations
-# - Added more robust volume control
-# - Added Hutton Orbital Radio support with new track retriever module
+# Previous versions (v3.2.0 and earlier)
+# - See prior changelogs for earlier changes including dynamic intervals and Hutton/SomaFM handling
 
 import vlc
 import threading
 import time
+import unicodedata
 from . import somafm_track_retriever as somaretriever
 from . import hutton_orbital_track_retriever as huttonretriever
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal, Callable
 from lib.PluginBase import PluginBase, PluginManifest
-from lib.PluginHelper import PluginHelper, PluginEvent
+from lib.PluginHelper import PluginHelper, PluginEvent, Projection
+from lib.Event import Event
 from lib.Logger import log
 from lib.PluginSettingDefinitions import (
     PluginSettings, SettingsGrid, SelectOption, TextAreaSetting, TextSetting,
     SelectSetting, NumericalSetting, ToggleSetting, ParagraphSetting
 )
+
+
+# Module-level Projection so it can be registered lazily from multiple places
+class RadioPlaybackProjection(Projection[dict]):
+    def get_default_state(self) -> dict:
+        return {
+            "current_station": None,
+            "current_title": None,
+            "last_updated": 0.0,
+            "command_triggered": False
+        }
+
+    def process(self, event: Event) -> None | list:
+        try:
+            if not isinstance(event, PluginEvent):
+                return None
+            if event.plugin_event_name != "radio_changed":
+                return None
+            content = event.plugin_event_content
+            if not isinstance(content, list) or len(content) < 2:
+                return None
+            title = content[0]
+            station = content[1]
+            command = content[2] if len(content) > 2 else False
+            ts = event.processed_at if getattr(event, 'processed_at', 0) else time.time()
+            self.state.update({
+                "current_station": station,
+                "current_title": title,
+                "last_updated": ts,
+                "command_triggered": bool(command)
+            })
+        except Exception:
+            return None
+        return None
 
 # ---------------------------------------------------------------------
 # Pre-installed radio stations
@@ -83,7 +121,7 @@ RADIO_STATIONS = {
     }
 }
 
-PLUGIN_LOG_LEVEL = "INFO"
+PLUGIN_LOG_LEVEL = "ERROR"
 _LEVELS = {"DEBUG": 10, "INFO": 20, "ERROR": 40}
 DEFAULT_VOLUME = 55
 DEFAULT_DJ_STYLE = "Speak like a DJ or make a witty comment. Keep it concise. Match your tone to the time of day."
@@ -115,6 +153,7 @@ class RadioPlugin(PluginBase):
         self.stop_monitor = False
         self._last_replied_title = None
         self._last_reply_time = 0
+        self.helper = None
 
         self.settings_config: PluginSettings | None = PluginSettings(
             key="RadioPlugin",
@@ -174,7 +213,10 @@ class RadioPlugin(PluginBase):
     def on_chat_start(self, helper: PluginHelper):
         """Initialize plugin when chat starts."""
         # Register actions
+        self.helper = helper
         self.register_actions(helper)
+        # Keep helper reference for projection/state queries
+        self.helper = helper
         
         # Register the radio_changed event
         helper.register_event(
@@ -182,8 +224,40 @@ class RadioPlugin(PluginBase):
             should_reply_check=lambda event: self._should_reply_to_radio_event(event),
             prompt_generator=lambda event: self._generate_radio_prompt(event)
         )
+        # Register the projection (attempt; may already be present). Using module-level
+        # RadioPlaybackProjection so we can register lazily elsewhere if needed.
+        try:
+            helper.register_projection(RadioPlaybackProjection())
+            p_log("INFO", "Registered RadioPlaybackProjection to remember current track")
+        except Exception as e:
+            p_log("DEBUG", f"RadioPlaybackProjection registration attempt returned: {e}")
         
         p_log("INFO", "RadioPlugin initialized successfully")
+
+    def ensure_projection_registered(self) -> None:
+        """Ensure the RadioPlaybackProjection is registered in the EventManager.
+
+        If the projection is missing and we have a helper, attempt to register it.
+        """
+        try:
+            evt_mgr = getattr(self, 'helper', None) and getattr(self.helper, '_event_manager', None)
+            if not evt_mgr:
+                p_log('DEBUG', 'ensure_projection_registered: event manager not available')
+                return
+            # Try to read existing projection; if it's missing, register it
+            try:
+                _ = evt_mgr.get_projection_state('RadioPlaybackProjection')
+                return
+            except Exception:
+                # Attempt to register using helper if possible
+                try:
+                    if self.helper:
+                        self.helper.register_projection(RadioPlaybackProjection())
+                        p_log('INFO', 'ensure_projection_registered: Registered RadioPlaybackProjection')
+                except Exception as e:
+                    p_log('DEBUG', f'enable_projection: register failed: {e}')
+        except Exception as e:
+            p_log('DEBUG', f'ensure_projection_registered error: {e}')
     # -----------------------------------------------------------------
     # SomaFM track retrieval
     # -----------------------------------------------------------------
@@ -248,16 +322,66 @@ class RadioPlugin(PluginBase):
         # Create a unque key for the title+station combo
         track_key = f"{normalized_title}|{station}"
 
-        # If same station and same title recently, skip
+        # Check projection state (if available) to see if this track was already announced
+        try:
+            # Ensure projection exists (lazy-register if needed)
+            try:
+                self.ensure_projection_registered()
+            except Exception:
+                pass
+            evt_mgr = getattr(self, 'helper', None) and getattr(self.helper, '_event_manager', None)
+            if evt_mgr:
+                try:
+                    proj_state = evt_mgr.get_projection_state('RadioPlaybackProjection')
+                    proj_title = proj_state.get('current_title')
+                    proj_station = proj_state.get('current_station')
+                    proj_title_norm = unicodedata.normalize('NFKC', (proj_title or '').strip()).casefold()
+                    # If the projection already recorded the same title/station and the event
+                    # was not command-triggered, we would normally suppress replying. However,
+                    # the projection may have been updated by the very same event just now.
+                    # To avoid suppressing the freshly-dispatched event, allow a small grace
+                    # period where projection.last_updated ~= event.processed_at.
+                    proj_last = proj_state.get('last_updated', 0) or 0
+                    # Extract event processed timestamp if available
+                    event_ts = 0
+                    try:
+                        event_ts = float(getattr(event, 'processed_at', 0) or 0)
+                    except Exception:
+                        try:
+                            event_ts = float(event.plugin_event_content[3]) if len(event.plugin_event_content) > 3 else 0
+                        except Exception:
+                            event_ts = 0
+
+                    # If projection matches title+station and the projection was updated earlier
+                    # than the event (by more than the grace window), suppress. If projection
+                    # was updated essentially at the same time as the event, allow the reply.
+                    grace_seconds = 1.5
+                    if proj_title_norm == normalized_title and proj_station == station and not command_triggered:
+                        if event_ts and abs(proj_last - event_ts) <= grace_seconds:
+                            p_log('DEBUG', f"Projection updated ~simultaneously (delta={abs(proj_last-event_ts):.2f}s); allowing reply for '{title}' on {station}.")
+                            # allow fall-through to reply
+                        else:
+                            p_log('DEBUG', f"Projection already recorded this track '{title}' on {station}; suppressing reply. Projection state: {proj_state}")
+                            return False
+                except Exception as e:
+                    p_log('DEBUG', f"Could not read RadioPlaybackProjection after ensure: {e}")
+        except Exception as e:
+            p_log('DEBUG', f"Could not read RadioPlaybackProjection: {e}")
+
+        # If same station and same title as last replied, suppress automatic announcements
+        # even after cooldown — but allow explicit user commands to force a reply.
         if normalized_title == last_title_norm and station == last_station:
-            if current_time - self._last_reply_time < 45:  # 45s cooldown for same song
-                p_log("DEBUG", f"Duplicate '{title}' on same station ignored (within 45s).")
-                return False
+            if command_triggered:
+                p_log("DEBUG", f"Same title on same station but command requested; allowing reply.")
+                # allow fall-through to reply
             else:
-                p_log("DEBUG", f"Same title on same station but cooldown passed, checking trigger.")
-        # If cooldown passed but not triggered by a command with counter > 0, ignore
+                p_log("DEBUG", f"Same title on same station and unchanged; suppressing announcement.")
+                return False
+
+        # For new titles or different stations, manage repeat counters to avoid
+        # noisy announcements on rapid repeats from retrievers.
         if not command_triggered:
-            #Counter +1
+            # Counter +1
             self._title_repeat_count[track_key] = self._title_repeat_count.get(track_key, 0) + 1
             if self._title_repeat_count[track_key] > 1:
                 p_log("DEBUG", f"Same title repeated {self._title_repeat_count[track_key]} times, ignoring")
@@ -265,11 +389,15 @@ class RadioPlugin(PluginBase):
             else:
                 p_log("DEBUG", f"First repeat of '{title}' after cooldown, allowing reply.")
         else:
-            #New title or new station, reset counter
+            # New title or new station triggered by command; reset counter
             self._title_repeat_count[track_key] = 0
 
-        # Update memory
-        self._last_replied_title = title
+        # Update memory: store normalized title for consistent future comparisons
+        try:
+            stored_norm = unicodedata.normalize('NFKC', (title or '').strip()).casefold()
+        except Exception:
+            stored_norm = (title or '').strip().lower()
+        self._last_replied_title = stored_norm
         self._last_replied_station = station
         self._last_reply_time = current_time
 
@@ -289,6 +417,7 @@ class RadioPlugin(PluginBase):
             p_log("ERROR", f"Invalid plugin_event_content format in prompt generator: {event.plugin_event_content}")
             return "IMPORTANT: React to this radio track change. The track information could not be retrieved."
         dj_style = self.settings.get('dj_response_style', DEFAULT_DJ_STYLE)
+        
         return f"IMPORTANT: React to this radio track change. New track: '{title}' on station '{station}'. {dj_style}"
 
     # -----------------------------------------------------------------
@@ -312,6 +441,13 @@ class RadioPlugin(PluginBase):
             "set_volume", "Set the radio volume",
             {"type": "object", "properties": {"volume": {"type": "integer", "minimum": 0, "maximum": 100}}, "required": ["volume"]},
             lambda args, states: self._set_volume(args["volume"]),
+            "global"
+        )
+        # Status action: return the current projection state for the radio
+        helper.register_action(
+            "radio_status", "Get current radio playback status",
+            {},
+            lambda args, states: self._radio_status(args, states),
             "global"
         )
 
@@ -408,6 +544,36 @@ class RadioPlugin(PluginBase):
             p_log("ERROR", f"Error setting volume: {e}")
             return f"Error setting volume: {e}"
 
+    def _radio_status(self, args=None, states=None):
+        """Return the current radio playback status from the projection."""
+        try:
+            # Ensure projection exists and is registered
+            try:
+                self.ensure_projection_registered()
+            except Exception:
+                pass
+
+            evt_mgr = getattr(self, 'helper', None) and getattr(self.helper, '_event_manager', None)
+            if not evt_mgr:
+                return "Radio status not available (event manager missing)."
+            try:
+                state = evt_mgr.get_projection_state('RadioPlaybackProjection')
+            except Exception as e:
+                return f"RadioPlaybackProjection not available: {e}"
+
+            station = state.get('current_station')
+            title = state.get('current_title')
+            last_updated_ts = state.get('last_updated')
+            try:
+                last_updated = datetime.fromtimestamp(last_updated_ts, timezone.utc).isoformat() if last_updated_ts else 'N/A'
+            except Exception:
+                last_updated = str(last_updated_ts)
+
+            return f"Station: {station or 'N/A'} | Title: {title or 'N/A'} | Last updated: {last_updated}"
+        except Exception as e:
+            p_log("ERROR", f"Error reading RadioPlaybackProjection for radio_status: {e}")
+            return f"Error retrieving radio status: {e}"
+
     # -----------------------------------------------------------------
     # Track monitoring
     # -----------------------------------------------------------------
@@ -416,22 +582,42 @@ class RadioPlugin(PluginBase):
         last_title = ""
         last_event_time = 0
         last_check_time = 0
-        checks_without_change = 0  # Counter: how many checks returned the same title
         # Define check intervals
         default_check_interval = 5  # 5 seconds for regular stations
         somafm_check_interval = 20  # Longer interval for SomaFM stations
 
         command_triggered = getattr(self, "command_triggered", False)
+        # If a command just triggered the play, wait ~8 seconds so the AI can respond
+        # before the monitor starts announcing tracks
+        if command_triggered:
+            p_log("DEBUG", "Delaying initial check by 8 seconds to allow AI response to command")
+            for _ in range(8):
+                if self.stop_monitor:
+                    return
+                time.sleep(1)
+        
         # Initialize station tracking so we can detect switches during monitoring
         prev_station = self.current_station
         is_somafm = self.is_somafm_station(prev_station) if prev_station else False
         is_hutton = "hutton" in (prev_station or "").lower()
-        # monitoring phase: start 'initial' to announce immediately, then move to 'reduced' after 2 checks without change
-        phase = 'initial'
-        immediate_check = False
-        check_interval = somafm_check_interval if is_somafm else default_check_interval
+        # Startup sequence state machine:
+        # We'll perform two checks at reduced_interval, then a third check at initial_interval,
+        # and optionally a fourth reduced check depending on results. This helps determine
+        # whether we started mid-track and avoids announcing stale metadata.
+        # Initialize intervals based on station type so we can start with reduced_interval.
+        if is_somafm or is_hutton:
+            initial_interval = 100
+            reduced_interval = 30
+        else:
+            initial_interval = 90
+            reduced_interval = 15
 
-        p_log("INFO", f"Track monitor started for {prev_station}. StartupSequence=True step=1 (SomaFM: {is_somafm}, Hutton: {is_hutton})")
+        startup_sequence = True
+        startup_step = 1  # 1..4 as described in design
+        prev_check_title = None
+        check_interval = reduced_interval
+
+        p_log("INFO", f"Track monitor started for {prev_station}. StartupSequence={startup_sequence} step={startup_step} (SomaFM: {is_somafm}, Hutton: {is_hutton})")
     
         while not self.stop_monitor:
             try:
@@ -439,6 +625,9 @@ class RadioPlugin(PluginBase):
                     time.sleep(1)  # Check more frequently if we should stop
                     continue
                 current_time = time.time()
+                # Refresh local view of the command trigger flag each loop so we
+                # reflect any changes made by other threads (e.g. clearing after dispatch).
+                command_triggered = getattr(self, "command_triggered", False)
                 if current_time - last_check_time < check_interval:
                     time.sleep(1)
                     continue
@@ -447,30 +636,31 @@ class RadioPlugin(PluginBase):
                 # Get track info based on station type
                 display_title = ""
 
-                # Re-evaluate station type and determine dynamic intervals based on phase
+                # Re-evaluate station type and determine dynamic intervals (restart startup sequence on change)
                 current_station = self.current_station
                 if current_station != prev_station:
-                    p_log("INFO", f"Station changed from {prev_station} -> {current_station}, resetting monitor phase")
+                    p_log("INFO", f"Station changed from {prev_station} -> {current_station}, restarting startup sequence")
                     prev_station = current_station
                     is_somafm = self.is_somafm_station(current_station) if current_station else False
                     is_hutton = "hutton" in (current_station or "").lower()
-                    # Reset detection state and phase on station change
+                    # Recompute intervals for the new station
+                    if is_somafm or is_hutton:
+                        initial_interval = 100  # SomaFM & Hutton: initial long wait (metadata can be delayed)
+                        reduced_interval = 30   # SomaFM & Hutton: follow-up checks still relatively long
+                    else:
+                        initial_interval = 90   # Other stations: wait ~typical track length (1-1.5 min)
+                        reduced_interval = 15   # Follow-up: shorter checks to catch next track
+                    # Reset detection state and restart the startup sequence on station change
                     last_title = ""
                     last_event_time = 0
                     last_check_time = 0
-                    phase = 'initial'
-                    checks_without_change = 0  # Reset counter on station change
-
-                # Compute intervals based on station type and current phase
-                if is_somafm or is_hutton:
-                    initial_interval = 120  # SomaFM & Hutton: initial long wait (metadata can be delayed)
-                    reduced_interval = 20   # SomaFM & Hutton: follow-up checks still relatively long
-                else:
-                    initial_interval = 90   # Other stations: wait ~typical track length (1-1.5 min)
-                    reduced_interval = 15   # Follow-up: shorter checks to catch next track
-
-                check_interval = initial_interval if phase == 'initial' else reduced_interval
-                p_log("DEBUG", f"Intervals initial={initial_interval}s reduced={reduced_interval}s -> using {check_interval}s (phase={phase})")
+                    startup_sequence = True
+                    startup_step = 1
+                    prev_check_title = None
+                # Ensure check_interval is defined (startup logic sets it during startup steps)
+                if 'check_interval' not in locals() or check_interval is None:
+                    check_interval = reduced_interval
+                p_log("DEBUG", f"Intervals initial={initial_interval}s reduced={reduced_interval}s -> current check_interval={check_interval}s (startup_step={startup_step}, startup_sequence={startup_sequence})")
 
                 if is_somafm:
                     # Use the specialized SomaFM track retriever
@@ -490,10 +680,12 @@ class RadioPlugin(PluginBase):
                     now_playing = media.get_meta(vlc.Meta.NowPlaying)
                     display_title = now_playing or title or ""
     
-                normalized_title = display_title.strip().lower()
+                # Normalize title robustly: strip, unicode normalize, and casefold for case-insensitive compare
+                normalized_title = unicodedata.normalize('NFKC', (display_title or '').strip()).casefold()
 
                 if not normalized_title:
-                    p_log("DEBUG", f"No title found for {self.current_station}, will check again later")
+                    default_check_interval = 5  # 5 seconds for regular stations
+                    command_triggered = getattr(self, "command_triggered", False)
                     # Check stop flag more frequently
                     for _ in range(5):
                         if self.stop_monitor:
@@ -501,52 +693,267 @@ class RadioPlugin(PluginBase):
                         time.sleep(1)
                     continue
 
-                if normalized_title != last_title and (current_time - last_event_time > 5) or command_triggered:
-                    p_log("DEBUG", f"New track detected: '{display_title}' (previous: '{last_title}')")
+                # If we're in the startup sequence, implement the desired lazy/active flow:
+                # 1) immediate announce on first check (startup_step == 1)
+                # 2) enter lazy mode using `initial_interval` and perform two lazy checks
+                #    (counts of unchanged checks). If after two lazy checks the title hasn't
+                #    changed, switch to active mode (startup_step == 3) with `reduced_interval`.
+                # 3) in active mode (step 3) poll at `reduced_interval` and when a change is
+                #    detected announce and return to lazy mode (step 2).
+                if startup_sequence:
+                    # Ensure checks counter exists
+                    if 'checks_without_change' not in locals():
+                        checks_without_change = 0
+
+                    # Step 1: immediate announce on startup
+                    if startup_step == 1:
+                        prev_check_title = normalized_title
+                        try:
+                            event = PluginEvent(kind="plugin", plugin_event_name="radio_changed", plugin_event_content=[display_title, current_station, command_triggered])
+                            p_log("INFO", f"Startup announce (step1) -> {display_title} (command triggered: {command_triggered})")
+                            helper.dispatch_event(event)
+                            p_log("DEBUG", "Event dispatched successfully (startup step 1)")
+                            # clear command flags so subsequent checks behave normally
+                            try:
+                                self.command_triggered = False
+                            except Exception:
+                                pass
+                            command_triggered = False
+                            last_title = normalized_title
+                            last_event_time = current_time
+                        except Exception as e:
+                            p_log("ERROR", f"Error dispatching startup step 1 event: {e}")
+                        # Move to lazy checks using the long initial interval
+                        startup_step = 2
+                        check_interval = initial_interval
+                        checks_without_change = 0
+                        last_check_time = current_time
+                        p_log("DEBUG", f"Startup step 1 done: recorded normalized='{prev_check_title}' -> lazy checks every {check_interval}s")
+                        time.sleep(check_interval)
+                        continue
+
+                    # Step 2: lazy checks at initial_interval (wait for two unchanged checks)
+                    if startup_step == 2:
+                        current_check = normalized_title
+                        p_log("DEBUG", f"Startup lazy check: compared normalized '{current_check}' to baseline '{prev_check_title}' (display now: '{display_title}')")
+                        # If it changed during lazy checks, announce and reset lazy counter
+                        if current_check and prev_check_title and current_check != prev_check_title:
+                            try:
+                                event = PluginEvent(kind="plugin", plugin_event_name="radio_changed", plugin_event_content=[display_title, current_station, command_triggered])
+                                p_log("INFO", f"Startup lazy announce -> {display_title} (command triggered: {command_triggered})")
+                                helper.dispatch_event(event)
+                                p_log("DEBUG", "Event dispatched successfully (startup lazy announce)")
+                                try:
+                                    self.command_triggered = False
+                                except Exception:
+                                    pass
+                                command_triggered = False
+                                last_title = current_check
+                                last_event_time = current_time
+                                # Baseline becomes the new title and remain in lazy mode
+                                prev_check_title = current_check
+                                checks_without_change = 0
+                                check_interval = initial_interval
+                                last_check_time = current_time
+                                time.sleep(check_interval)
+                                continue
+                            except Exception as e:
+                                p_log("ERROR", f"Error dispatching startup lazy announce: {e}")
+
+                        # No change on this lazy check
+                        checks_without_change = checks_without_change + 1
+                        p_log("DEBUG", f"Startup lazy unchanged count = {checks_without_change}")
+                        if checks_without_change >= 2:
+                            # After two unchanged lazy checks, switch to active monitoring (reduced interval)
+                            startup_step = 3
+                            check_interval = reduced_interval
+                            p_log("DEBUG", f"Switching to active monitoring (step3) every {check_interval}s after {checks_without_change} lazy checks")
+                            last_check_time = current_time
+                            time.sleep(check_interval)
+                            continue
+                        else:
+                            # Continue lazy checks
+                            last_check_time = current_time
+                            time.sleep(check_interval)
+                            continue
+
+                    # Step 3: active monitoring at reduced_interval until the title changes
+                    if startup_step == 3:
+                        active_check = normalized_title
+                        p_log("DEBUG", f"Startup active check: comparing '{active_check}' to baseline '{prev_check_title}' (display now: '{display_title}')")
+                        if active_check and prev_check_title and active_check != prev_check_title:
+                            try:
+                                event = PluginEvent(kind="plugin", plugin_event_name="radio_changed", plugin_event_content=[display_title, current_station, command_triggered])
+                                p_log("INFO", f"Startup active announce (step3) -> {display_title} (command triggered: {command_triggered})")
+                                helper.dispatch_event(event)
+                                p_log("DEBUG", "Event dispatched successfully (startup active announce)")
+                                try:
+                                    self.command_triggered = False
+                                except Exception:
+                                    pass
+                                command_triggered = False
+                                last_title = active_check
+                                last_event_time = current_time
+                            except Exception as e:
+                                p_log("ERROR", f"Error dispatching startup active announce: {e}")
+                            # After announcing on active mode, return to lazy mode
+                            prev_check_title = active_check
+                            checks_without_change = 0
+                            startup_step = 2
+                            check_interval = initial_interval
+                            p_log("DEBUG", f"Change detected during active monitoring; returning to lazy mode ({check_interval}s)")
+                            last_check_time = current_time
+                            time.sleep(check_interval)
+                            continue
+                        else:
+                            # No change; keep active monitoring
+                            last_check_time = current_time
+                            time.sleep(check_interval)
+                            continue
+                    # Step 1: immediate announce on startup
+                    if startup_step == 1:
+                        prev_check_title = normalized_title
+                        try:
+                            event = PluginEvent(kind="plugin", plugin_event_name="radio_changed", plugin_event_content=[display_title, current_station, command_triggered])
+                            p_log("INFO", f"Startup announce (step1) -> {display_title} (command triggered: {command_triggered})")
+                            helper.dispatch_event(event)
+                            p_log("DEBUG", "Event dispatched successfully (startup step 1)")
+                            # clear both persistent and local flags so subsequent
+                            # iterations do not treat this as a command-triggered event
+                            try:
+                                self.command_triggered = False
+                            except Exception:
+                                pass
+                            command_triggered = False
+                            last_title = normalized_title
+                            last_event_time = current_time
+                        except Exception as e:
+                            p_log("ERROR", f"Error dispatching startup step 1 event: {e}")
+                        # Move to safety reduced check
+                        startup_step = 2
+                        check_interval = reduced_interval
+                        last_check_time = current_time
+                        p_log("DEBUG", f"Startup step 1 done: recorded normalized='{prev_check_title}' display='{display_title}' -> next reduced check in {check_interval}s")
+                        time.sleep(check_interval)
+                        continue
+
+                    # Step 2: reduced-interval safety check
+                    if startup_step == 2:
+                        second_title = normalized_title
+                        p_log("DEBUG", f"Startup step 2: compared normalized '{second_title}' to first '{prev_check_title}' (display now: '{display_title}')")
+                        # If second check differs from first, announce the new track
+                        if second_title and prev_check_title and second_title != prev_check_title:
+                            try:
+                                event = PluginEvent(kind="plugin", plugin_event_name="radio_changed", plugin_event_content=[display_title, current_station, command_triggered])
+                                p_log("INFO", f"Startup announce (step2) -> {display_title} (command triggered: {command_triggered})")
+                                helper.dispatch_event(event)
+                                p_log("DEBUG", "Event dispatched successfully (startup step 2)")
+                                try:
+                                    self.command_triggered = False
+                                except Exception:
+                                    pass
+                                command_triggered = False
+                                last_title = second_title
+                                last_event_time = current_time
+                            except Exception as e:
+                                p_log("ERROR", f"Error dispatching startup step 2 event: {e}")
+                        # Regardless of announce or not, move to initial-interval check (step 3)
+                        startup_step = 3
+                        check_interval = initial_interval
+                        prev_check_title = second_title or prev_check_title
+                        last_check_time = current_time
+                        p_log("DEBUG", f"Startup step 2 complete: moving to initial interval ({check_interval}s)")
+                        time.sleep(check_interval)
+                        continue
+
+                    # Step 3: check at initial_interval
+                    if startup_step == 3:
+                        third_title = normalized_title
+                        p_log("DEBUG", f"Startup step 3 (initial interval): compared normalized '{third_title}' to previous '{prev_check_title}' (display now: '{display_title}')")
+                        if third_title and prev_check_title and third_title != prev_check_title:
+                            # Announce change and remain using initial_interval
+                            try:
+                                event = PluginEvent(kind="plugin", plugin_event_name="radio_changed", plugin_event_content=[display_title, current_station, command_triggered])
+                                p_log("INFO", f"Startup announce (step3) -> {display_title} (command triggered: {command_triggered})")
+                                helper.dispatch_event(event)
+                                p_log("DEBUG", "Event dispatched successfully (startup step 3)")
+                                try:
+                                    self.command_triggered = False
+                                except Exception:
+                                    pass
+                                command_triggered = False
+                                last_title = third_title
+                                last_event_time = current_time
+                            except Exception as e:
+                                p_log("ERROR", f"Error dispatching startup step 3 event: {e}")
+                            # Exit startup sequence into steady reduced mode (use reduced interval)
+                            startup_sequence = False
+                            check_interval = reduced_interval
+                            # Reset numeric startup step so logging/diagnostics show steady-state clearly
+                            startup_step = 0
+                            p_log("DEBUG", f"Entering steady state: reduced interval ({check_interval}s) (startup_step reset)")
+                            continue
+                        else:
+                            # No change on initial-interval check: perform a fourth reduced check
+                            startup_step = 4
+                            prev_check_title = third_title or prev_check_title
+                            check_interval = reduced_interval
+                            last_check_time = current_time
+                            p_log("DEBUG", f"Startup step 3 saw no change: scheduling reduced follow-up in {check_interval}s")
+                            time.sleep(check_interval)
+                            continue
+
+                    # Step 4: final reduced check
+                    if startup_step == 4:
+                        fourth_title = normalized_title
+                        p_log("DEBUG", f"Startup step 4 (reduced): compared normalized '{fourth_title}' to previous '{prev_check_title}' (display now: '{display_title}')")
+                        if fourth_title and prev_check_title and fourth_title != prev_check_title:
+                            try:
+                                event = PluginEvent(kind="plugin", plugin_event_name="radio_changed", plugin_event_content=[display_title, current_station, command_triggered])
+                                p_log("INFO", f"Startup announce (step4) -> {display_title} (command triggered: {command_triggered})")
+                                helper.dispatch_event(event)
+                                p_log("DEBUG", "Event dispatched successfully (startup step 4)")
+                                try:
+                                    self.command_triggered = False
+                                except Exception:
+                                    pass
+                                command_triggered = False
+                                last_title = fourth_title
+                                last_event_time = current_time
+                            except Exception as e:
+                                p_log("ERROR", f"Error dispatching startup step 4 event: {e}")
+                        # After step 4, whether changed or not, enter steady reduced mode
+                        startup_sequence = False
+                        check_interval = reduced_interval
+                        # Reset numeric startup step so logging/diagnostics show steady-state clearly
+                        startup_step = 0
+                        p_log("DEBUG", f"Entering steady state: reduced interval ({check_interval}s) (startup_step reset)")
+                        continue
+
+                # Normal steady-state monitoring: announce when track changes compared to last announced title
+                # Note: last_title is always normalized for consistent comparison. Use explicit parentheses
+                # to avoid operator-precedence surprises.
+                if (normalized_title != last_title and (current_time - last_event_time > 5)) or command_triggered:
+                    p_log("DEBUG", f"New track detected: '{display_title}' (previous normalized: '{last_title}')")
                     last_title = normalized_title
                     last_event_time = current_time
-                    checks_without_change = 0  # Reset counter when track DOES change
-            
-                   # Only create event if we're still playing the same station
+                    # Only create event if we're still playing the same station
                     if not self.stop_monitor:
                         try:
                             event = PluginEvent(
                                 kind="plugin",
                                 plugin_event_name="radio_changed",
                                 plugin_event_content=[display_title, current_station, command_triggered]
-                            )                    
+                            )
                             p_log("INFO", f"Track changed -> {display_title} (command triggered: {command_triggered})")
                             helper.dispatch_event(event)
                             p_log("DEBUG", "Event dispatched successfully")
-                            # After announcing a new track, reset to initial interval to ensure stable detection.
-                            # Phase will drop to 'reduced' after 2 more checks without track change.
-                            phase = 'initial'
+                            # After announcing a new track in steady state, keep the current interval
                             command_triggered = False
-                            # Ensure we use the initial (longer) interval for the next check cycle
-                            try:
-                                check_interval = initial_interval
-                            except NameError:
-                                check_interval = somafm_check_interval if is_somafm or is_hutton else default_check_interval
-                            # Record the last check time so the loop waits the full initial interval
-                            last_check_time = current_time
-                            # Do not request an immediate follow-up check; wait the long interval instead
-                            p_log("DEBUG", f"Announced track; resetting to initial interval (check_interval={check_interval}s)")
                         except Exception as e:
                             p_log("ERROR", f"Error creating or dispatching event: {e}")
-                else:
-                    # Track did NOT change - increment counter
-                    checks_without_change += 1
-                    # After 2 checks of same track, switch to reduced interval for efficiency
-                    if checks_without_change >= 2 and phase == 'initial':
-                        phase = 'reduced'
-                        p_log("DEBUG", f"Same track for {checks_without_change} checks -> switching to reduced interval (phase=reduced)")
 
-                # Use the calculated check interval unless an immediate check was requested
-                if immediate_check:
-                    immediate_check = False
-                    p_log("DEBUG", f"Skipping sleep to perform immediate follow-up check (using {check_interval}s next)")
-                    continue
-                # Regular sleep
+                # Regular sleep for steady-state or in-case fallback
                 time.sleep(check_interval)
             except Exception as e:
                 p_log("ERROR", f"Track monitor error: {e}")
