@@ -136,6 +136,10 @@ RADIO_STATIONS = {
     "GalNET Radio": {
         "url": "http://listen.radionomy.com/galnet",
         "description": "Sci-fi themed station with ambient, rock, and classical music, plus GalNet news."
+    },
+    "BigFM": {
+        "url": "https://streams.bigfm.de/bigfm-deutschland-128-mp3",
+        "description": "Popular German hits and chart-toppers for energetic flights." 
     }
 }
 
