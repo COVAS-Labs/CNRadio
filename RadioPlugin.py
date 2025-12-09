@@ -1,4 +1,9 @@
-# RadioPlugin v3.3.1
+# RadioPlugin v3.3.2
+# -------------------
+# Release 3.3.2 - Dec 2025
+# Removed projection system to reduce token usage while maintaining functionality
+# Replaced with in-memory state tracking for current station and track
+# Added new radio stations: Kohina Radio, Radio CVGM, Nectarine Demoscene Radio
 # -------------------
 # Release 3.3.1 - Dec 2025
 # Added support for Radio Deejay station with dedicated track retriever.
@@ -20,12 +25,7 @@
 #   (explicit user commands still force a reply).
 # - Robust title normalization using Unicode NFKC + `casefold()` to avoid false
 #   positives from case or Unicode variants.
-# - Added `RadioPlaybackProjection` to persist current station/title in projections
-#   so Covas:NEXT can remember what's playing across sessions.
 # - Improved debug logging and fixed several edge-cases in the startup/check flow.
-#
-# Previous versions (v3.2.0 and earlier)
-# - See prior changelogs for earlier changes including dynamic intervals and Hutton/SomaFM handling
 
 import vlc
 import threading
@@ -38,18 +38,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal, Callable, Optional
 from lib.PluginBase import PluginBase, PluginManifest
-from lib.PluginHelper import PluginHelper, PluginEvent, Projection
+from lib.PluginHelper import PluginHelper, PluginEvent
 from lib.Event import Event
 from lib.Logger import log
 from lib.PluginSettingDefinitions import (
     PluginSettings, SettingsGrid, SelectOption, TextAreaSetting, TextSetting,
     SelectSetting, NumericalSetting, ToggleSetting, ParagraphSetting
 )
-
 # ---------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------
-PLUGIN_LOG_LEVEL = "INFO"
+PLUGIN_LOG_LEVEL = "DEBUG"
 _LEVELS = {"DEBUG": 10, "INFO": 20, "ERROR": 40}
 DEFAULT_VOLUME = 55
 DEFAULT_DJ_STYLE = "Speak like a DJ or make a witty comment. Keep it concise. Match your tone to the time of day."
@@ -63,41 +62,6 @@ COMMAND_RESPONSE_DELAY = 8  # seconds to wait after command before announcing
 MIN_EVENT_INTERVAL = 5  # minimum seconds between track announcements
 GRACE_PERIOD = 1.5  # seconds for projection update grace period
 MIN_TITLE_LENGTH = 3  # minimum length for valid titles
-
-# ---------------------------------------------------------------------
-# Module-level Projection
-# ---------------------------------------------------------------------
-class RadioPlaybackProjection(Projection[dict]):
-    def get_default_state(self) -> dict:
-        return {
-            "current_station": None,
-            "current_title": None,
-            "last_updated": 0.0,
-            "command_triggered": False
-        }
-
-    def process(self, event: Event) -> None | list:
-        try:
-            if not isinstance(event, PluginEvent):
-                return None
-            if event.plugin_event_name != "radio_changed":
-                return None
-            content = event.plugin_event_content
-            if not isinstance(content, list) or len(content) < 2:
-                return None
-            title = content[0]
-            station = content[1]
-            command = content[2] if len(content) > 2 else False
-            ts = event.processed_at if getattr(event, 'processed_at', 0) else time.time()
-            self.state.update({
-                "current_station": station,
-                "current_title": title,
-                "last_updated": ts,
-                "command_triggered": bool(command)
-            })
-        except Exception:
-            return None
-        return None
 
 # ---------------------------------------------------------------------
 # Pre-installed radio stations
@@ -157,10 +121,21 @@ RADIO_STATIONS = {
     },
     "Radio DeeJay Linetti": {
         "url": "https://streamcdnm3-4c4b867c89244861ac216426883d1ad0.msvdn.net/webradio/deejaywfmlinus/live.m3u8",
-        "description": "Italian station featuring DJ Linux preferred songs from '80 to today."
+        "description": "Italian station featuring DJ Linus preferred songs from '80 to today."
+    },
+    "Kohina Radio": {
+        "url": "https://player.kohina.com/icecast/stream.opus",
+        "description": "Hand picked chip tunes from classic computers and consoles. SID, Amiga, Atari ST, Arcade, PC, and more!"
+    },
+    "Radio CVGM": {
+        "url": "http://radio.cvgm.net:8000/cvgm128",
+        "description": "Video game music station featuring soundtracks from classic and modern games, demo scene and computer music."
+    },
+    "Nectarine Demoscene Radio": {
+        "url": "http://necta.burn.net:8000/nectarine",
+        "description": "Demoscene music station playing tracks from the demoscene community."
     }
 }
-
 # ---------------------------------------------------------------------
 # Helper logger
 # ---------------------------------------------------------------------
@@ -241,6 +216,14 @@ class RadioPlugin(PluginBase):
         self._last_reply_time = 0
         self.helper = None
         self._title_repeat_count = {}
+        
+        # In-memory state to replace projection
+        self._radio_state = {
+            "current_station": None,
+            "current_title": None,
+            "last_updated": 0.0,
+            "command_triggered": False
+        }
 
         self.settings_config: PluginSettings | None = PluginSettings(
             key="RadioPlugin",
@@ -309,30 +292,7 @@ class RadioPlugin(PluginBase):
             prompt_generator=lambda event: self._generate_radio_prompt(event)
         )
         
-        # Register the projection
-        self.ensure_projection_registered()
-        
         p_log("INFO", "RadioPlugin initialized successfully")
-
-    def ensure_projection_registered(self) -> None:
-        """Ensure the RadioPlaybackProjection is registered in the EventManager."""
-        try:
-            evt_mgr = getattr(self, 'helper', None) and getattr(self.helper, '_event_manager', None)
-            if not evt_mgr:
-                p_log('DEBUG', 'ensure_projection_registered: event manager not available')
-                return
-                
-            # Try to read existing projection; if it's missing, register it
-            try:
-                _ = evt_mgr.get_projection_state('RadioPlaybackProjection')
-                p_log('DEBUG', 'RadioPlaybackProjection already registered')
-            except Exception:
-                # Attempt to register using helper if possible
-                if self.helper:
-                    self.helper.register_projection(RadioPlaybackProjection())
-                    p_log('INFO', 'Registered RadioPlaybackProjection to remember current track')
-        except Exception as e:
-            p_log('DEBUG', f'ensure_projection_registered error: {e}')
 
     # -----------------------------------------------------------------
     # Station type detection
@@ -376,6 +336,7 @@ class RadioPlugin(PluginBase):
         if not station_name:
             return False
         return "hutton" in station_name.lower()
+        
     @staticmethod
     def is_deejay_station(station_name: str) -> bool:
         """Check if a station name refers to Radio Deejay."""
@@ -386,7 +347,9 @@ class RadioPlugin(PluginBase):
     @staticmethod
     def is_special_station(station_name: str) -> bool:
         """Check if a station requires special handling (SomaFM or Hutton)."""
-        return (RadioPlugin.is_somafm_station(station_name) or RadioPlugin.is_hutton_station(station_name) or RadioPlugin.is_deejay_station(station_name))
+        return (RadioPlugin.is_somafm_station(station_name) or 
+                RadioPlugin.is_hutton_station(station_name) or 
+                RadioPlugin.is_deejay_station(station_name))
     
     @staticmethod
     def normalize_title(title: str) -> str:
@@ -407,88 +370,57 @@ class RadioPlugin(PluginBase):
             title = content[0]
             station = content[1]
             command_triggered = content[2] if len(content) > 2 else False
+            event_time = content[3] if len(content) > 3 else time.time()
         except (ValueError, TypeError):
             p_log("ERROR", f"Invalid plugin_event_content format: {event.plugin_event_content}")
             return False
-            
+        
         # Skip empty or invalid titles
         if not title or "unknown" in title.lower() or len(title.strip()) < MIN_TITLE_LENGTH:
             p_log("DEBUG", "Ignoring empty or invalid title")
             return False
-        
+    
         normalized_title = self.normalize_title(title)
         last_title_norm = self.normalize_title(self._last_replied_title or "")
         last_station = self._last_replied_station
         current_time = time.time()
-        
+    
         # Create a unique key for the title+station combo
         track_key = f"{normalized_title}|{station}"
+    
+        # Always allow command-triggered events
+        if command_triggered:
+            p_log("DEBUG", f"Command triggered event, allowing reply for '{title}' on {station}")
         
-        # Check projection state to see if this track was already announced
-        try:
-            self.ensure_projection_registered()
-            evt_mgr = getattr(self, 'helper', None) and getattr(self.helper, '_event_manager', None)
-            
-            if evt_mgr:
-                try:
-                    proj_state = evt_mgr.get_projection_state('RadioPlaybackProjection')
-                    proj_title = proj_state.get('current_title')
-                    proj_station = proj_state.get('current_station')
-                    proj_title_norm = self.normalize_title(proj_title or '')
-                    
-                    # Get timestamps for comparison
-                    proj_last = proj_state.get('last_updated', 0) or 0
-                    event_ts = 0
-                    try:
-                        event_ts = float(getattr(event, 'processed_at', 0) or 0)
-                    except Exception:
-                        try:
-                            event_ts = float(event.plugin_event_content[3]) if len(event.plugin_event_content) > 3 else 0
-                        except Exception:
-                            event_ts = 0
-                    
-                    # If projection matches title+station and was updated earlier than the event
-                    # (by more than grace period), suppress. Otherwise allow the reply.
-                    if proj_title_norm == normalized_title and proj_station == station and not command_triggered:
-                        if event_ts and abs(proj_last - event_ts) <= GRACE_PERIOD:
-                            p_log('DEBUG', f"Projection updated ~simultaneously (delta={abs(proj_last-event_ts):.2f}s); allowing reply for '{title}' on {station}.")
-                            # allow fall-through to reply
-                        else:
-                            p_log('DEBUG', f"Projection already recorded this track '{title}' on {station}; suppressing reply.")
-                            return False
-                except Exception as e:
-                    p_log('DEBUG', f"Could not read RadioPlaybackProjection: {e}")
-        except Exception as e:
-            p_log('DEBUG', f"Error checking projection: {e}")
+            # Update memory for future comparisons
+            self._last_replied_title = title
+            self._last_replied_station = station
+            self._last_reply_time = current_time
         
-        # If same station and same title as last replied, suppress automatic announcements
-        # but allow explicit user commands to force a reply
-        if normalized_title == last_title_norm and station == last_station:
-            if command_triggered:
-                p_log("DEBUG", f"Same title on same station but command requested; allowing reply.")
-                # allow fall-through to reply
-            else:
-                p_log("DEBUG", f"Same title on same station and unchanged; suppressing announcement.")
-                return False
-        
-        # For new titles or different stations, manage repeat counters
-        if not command_triggered:
-            # Increment counter
-            self._title_repeat_count[track_key] = self._title_repeat_count.get(track_key, 0) + 1
-            if self._title_repeat_count[track_key] > 1:
-                p_log("DEBUG", f"Same title repeated {self._title_repeat_count[track_key]} times, ignoring")
-                return False
-            else:
-                p_log("DEBUG", f"First occurrence of '{title}' after cooldown, allowing reply.")
-        else:
             # Reset counter for command-triggered events
             self._title_repeat_count[track_key] = 0
         
+            return True
+    
+        # If same station and same title as last replied, suppress automatic announcements
+        if normalized_title == last_title_norm and station == last_station:
+            p_log("DEBUG", f"Same title on same station and unchanged; suppressing announcement.")
+            return False
+    
+        # For new titles or different stations, manage repeat counters
+        # Increment counter
+        self._title_repeat_count[track_key] = self._title_repeat_count.get(track_key, 0) + 1
+        if self._title_repeat_count[track_key] > 1:
+            p_log("DEBUG", f"Same title repeated {self._title_repeat_count[track_key]} times, ignoring")
+            return False
+        else:
+            p_log("DEBUG", f"First occurrence of '{title}' after cooldown, allowing reply.")
+    
         # Update memory for future comparisons
         self._last_replied_title = title
         self._last_replied_station = station
         self._last_reply_time = current_time
-        
+    
         p_log("DEBUG", f"Will reply to '{title}' on {station}")
         return True
     
@@ -530,7 +462,7 @@ class RadioPlugin(PluginBase):
             lambda args, states: self._set_volume(args["volume"]),
             "global"
         )
-        # Status action: return the current projection state for the radio
+        # Status action: return the current in-memory state for the radio
         helper.register_action(
             "radio_status", "Get current radio playback status",
             {},
@@ -548,15 +480,15 @@ class RadioPlugin(PluginBase):
     def _start_radio(self, url, station_name, helper: PluginHelper):
         # Ensure proper cleanup of previous radio session
         self._stop_radio()
-    
+
         if not url:
             p_log("ERROR", f"URL for station {station_name} not found.")
             return f"URL for station {station_name} not found."
-        
+    
         try:
             # Wait a moment to ensure previous thread is fully terminated
             time.sleep(0.5)
-        
+    
             self.player = vlc.MediaPlayer(url)
             self.player.play()
             default_volume = self.settings.get('default_volume', DEFAULT_VOLUME)
@@ -565,6 +497,8 @@ class RadioPlugin(PluginBase):
             self.current_station = station_name
             self.playing = True
             self.stop_monitor.clear()  # Reset the stop event
+        
+            # Ensure command_triggered is set to True for both new plays and station changes
             self.monitor_state.command_triggered = True
             self.monitor_state.reset_for_station_change(station_name)
 
@@ -576,13 +510,12 @@ class RadioPlugin(PluginBase):
                     daemon=True  # Make thread daemon so it exits when main thread exits
                 )
                 self.track_monitor_thread.start()
-        
+    
             p_log("INFO", f"Started playing {station_name} at volume {default_volume}")
             return f"Playing {station_name} at volume {default_volume}"
         except Exception as e:
             p_log("ERROR", f"Failed to start radio: {e}")
             return f"Error starting radio: {e}"
-
     def _stop_radio(self):
         try:
             # Set flag to stop monitoring thread
@@ -596,6 +529,14 @@ class RadioPlugin(PluginBase):
             self.playing = False
             self.current_station = None
             self.monitor_state.command_triggered = False
+            
+            # Clear in-memory state
+            self._radio_state.update({
+                "current_station": None,
+                "current_title": None,
+                "last_updated": 0.0,
+                "command_triggered": False
+            })
         
             # Wait for thread to terminate with timeout
             if self.track_monitor_thread and self.track_monitor_thread.is_alive():
@@ -632,28 +573,12 @@ class RadioPlugin(PluginBase):
         except Exception as e:
             p_log("ERROR", f"Error setting volume: {e}")
             return f"Error setting volume: {e}"
-
     def _radio_status(self, args=None, states=None):
-        """Return the current radio playback status from the projection."""
+        """Return the current radio playback status from in-memory state."""
         try:
-            # Ensure projection exists and is registered
-            try:
-                self.ensure_projection_registered()
-            except Exception:
-                pass
-
-            evt_mgr = getattr(self, 'helper', None) and getattr(self.helper, '_event_manager', None)
-            if not evt_mgr:
-                return "Radio status not available (event manager missing)."
-                
-            try:
-                state = evt_mgr.get_projection_state('RadioPlaybackProjection')
-            except Exception as e:
-                return f"RadioPlaybackProjection not available: {e}"
-
-            station = state.get('current_station')
-            title = state.get('current_title')
-            last_updated_ts = state.get('last_updated')
+            station = self._radio_state.get('current_station')
+            title = self._radio_state.get('current_title')
+            last_updated_ts = self._radio_state.get('last_updated')
             
             try:
                 last_updated = datetime.fromtimestamp(last_updated_ts, timezone.utc).isoformat() if last_updated_ts else 'N/A'
@@ -662,7 +587,7 @@ class RadioPlugin(PluginBase):
 
             return f"Station: {station or 'N/A'} | Title: {title or 'N/A'} | Last updated: {last_updated}"
         except Exception as e:
-            p_log("ERROR", f"Error reading RadioPlaybackProjection for radio_status: {e}")
+            p_log("ERROR", f"Error reading radio status: {e}")
             return f"Error retrieving radio status: {e}"
     # -----------------------------------------------------------------
     # Track monitoring
@@ -670,8 +595,8 @@ class RadioPlugin(PluginBase):
     def _monitor_track_changes(self, helper: PluginHelper):
         """Monitor VLC metadata and trigger an event when the track changes."""
         state = self.monitor_state
-        
-        # If a command just triggered the play, wait before the monitor starts announcing tracks
+    
+        # If a command just triggered the play or change, wait before the monitor starts announcing tracks
         if state.command_triggered:
             p_log("DEBUG", f"Delaying initial check by {COMMAND_RESPONSE_DELAY} seconds to allow AI response to command")
             for _ in range(COMMAND_RESPONSE_DELAY):
@@ -679,12 +604,12 @@ class RadioPlugin(PluginBase):
                     return
                 time.sleep(1)
             state.command_triggered = False
-        
+    
         # Initialize state for the current station
         state.reset_for_station_change(self.current_station)
-        
+    
         p_log("INFO", f"Track monitor started for {state.current_station}. Lazy mode active with interval {state.lazy_interval}s")
-        
+         
         # Main monitoring loop
         while not self.stop_monitor.is_set():
             try:
@@ -729,6 +654,7 @@ class RadioPlugin(PluginBase):
                 time.sleep(5)
         
         p_log("INFO", f"Track monitor stopped for {state.current_station}.")
+        
     def _get_track_info(self, station_name: str) -> str:
         """Get the current track info based on station type."""
         if not station_name:
@@ -822,17 +748,41 @@ class RadioPlugin(PluginBase):
             if not title or len(title.strip()) < MIN_TITLE_LENGTH:
                 p_log("DEBUG", f"Not announcing invalid title: '{title}'")
                 return
-                
-            p_log("INFO", f"Announcing track: '{title}' on {station} (command triggered: {command_triggered})")
             
+            p_log("INFO", f"Announcing track: '{title}' on {station} (command triggered: {command_triggered})")
+        
             # Create and dispatch the event
             event = PluginEvent(
                 kind="plugin",
                 plugin_event_name="radio_changed",
                 plugin_event_content=[title, station, command_triggered, time.time()]
             )
+        
+            # Temporarily store the current state to restore it after event processing
+            temp_state = self._radio_state.copy()
+        
+            # Clear the state to ensure the event is processed
+            self._radio_state = {
+                "current_station": None,
+                "current_title": None,
+                "last_updated": 0.0,
+                "command_triggered": False
+            }
+        
+            # Dispatch the event
             helper.dispatch_event(event)
+        
+            # Wait a short time to ensure event processing starts
+            time.sleep(0.5)
+        
+            # Now update the state
+            self._radio_state.update({
+                "current_station": station,
+                "current_title": title,
+                "last_updated": time.time(),
+                "command_triggered": command_triggered
+            })
+        
             p_log("DEBUG", "Event dispatched successfully")
         except Exception as e:
             p_log("ERROR", f"Error announcing track: {e}")
-"""Radio Plugin for Covas:NEXT - Internet Radio with Track Announcements."""
