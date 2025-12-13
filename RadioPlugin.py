@@ -1,4 +1,8 @@
-# RadioPlugin v3.3.2
+# RadioPlugin v3.3.3
+# -------------------
+# Release 3.3.3 - Dec 2025
+# Removed unused radio_status action to streamline code
+# Fixed minor bug in stop_radio action definition type object with empty parameters
 # -------------------
 # Release 3.3.2 - Dec 2025
 # Removed projection system to reduce token usage while maintaining functionality
@@ -48,7 +52,7 @@ from lib.PluginSettingDefinitions import (
 # ---------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------
-PLUGIN_LOG_LEVEL = "INFO"
+PLUGIN_LOG_LEVEL = "DEBUG"
 _LEVELS = {"DEBUG": 10, "INFO": 20, "ERROR": 40}
 DEFAULT_VOLUME = 55
 DEFAULT_DJ_STYLE = "Speak like a DJ or make a witty comment. Keep it concise. Match your tone to the time of day."
@@ -453,7 +457,7 @@ class RadioPlugin(PluginBase):
             lambda args, states: self._start_radio(RADIO_STATIONS.get(args["station"], {}).get("url"), args["station"], helper),
             "global"
         )
-        helper.register_action("stop_radio", "Stop the radio", {}, lambda args, states: self._stop_radio(), "global")
+        helper.register_action("stop_radio", "Stop the radio", {"type":"object","parameters":{}}, lambda args, states: self._stop_radio(), "global")
         helper.register_action(
             "change_radio", "Change to another station",
             {"type": "object", "properties": {"station": {"type": "string", "enum": list(RADIO_STATIONS.keys())}}, "required": ["station"]},
@@ -467,12 +471,12 @@ class RadioPlugin(PluginBase):
             "global"
         )
         # Status action: return the current in-memory state for the radio
-        helper.register_action(
-            "radio_status", "Get current radio playback status",
-            {},
-            lambda args, states: self._radio_status(args, states),
-            "global"
-        )
+#        helper.register_action(
+#            "radio_status", "Get current radio playback status",
+#            {},
+#            lambda args, states: self._radio_status(args, states),
+#            "global"
+#        )
     # -----------------------------------------------------------------
     # Player control
     # -----------------------------------------------------------------
@@ -577,22 +581,22 @@ class RadioPlugin(PluginBase):
         except Exception as e:
             p_log("ERROR", f"Error setting volume: {e}")
             return f"Error setting volume: {e}"
-    def _radio_status(self, args=None, states=None):
-        """Return the current radio playback status from in-memory state."""
-        try:
-            station = self._radio_state.get('current_station')
-            title = self._radio_state.get('current_title')
-            last_updated_ts = self._radio_state.get('last_updated')
-            
-            try:
-                last_updated = datetime.fromtimestamp(last_updated_ts, timezone.utc).isoformat() if last_updated_ts else 'N/A'
-            except Exception:
-                last_updated = str(last_updated_ts)
+#    def _radio_status(self, args=None, states=None):
+#        """Return the current radio playback status from in-memory state."""
+#        try:
+#            station = self._radio_state.get('current_station')
+#            title = self._radio_state.get('current_title')
+#            last_updated_ts = self._radio_state.get('last_updated')
+#            
+#            try:
+#                last_updated = datetime.fromtimestamp(last_updated_ts, timezone.utc).isoformat() if last_updated_ts else 'N/A'
+#            except Exception:
+#                last_updated = str(last_updated_ts)
 
-            return f"Station: {station or 'N/A'} | Title: {title or 'N/A'} | Last updated: {last_updated}"
-        except Exception as e:
-            p_log("ERROR", f"Error reading radio status: {e}")
-            return f"Error retrieving radio status: {e}"
+#            return f"Station: {station or 'N/A'} | Title: {title or 'N/A'} | Last updated: {last_updated}"
+#        except Exception as e:
+#            p_log("ERROR", f"Error reading radio status: {e}")
+#            return f"Error retrieving radio status: {e}"
     # -----------------------------------------------------------------
     # Track monitoring
     # -----------------------------------------------------------------
