@@ -1,4 +1,4 @@
-# RadioPlugin v3.3.3
+# RadioPlugin v3.3.3a
 # -------------------
 # Release 3.3.3 - Dec 2025
 # Removed unused radio_status action to streamline code
@@ -52,7 +52,7 @@ from lib.PluginSettingDefinitions import (
 # ---------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------
-PLUGIN_LOG_LEVEL = "DEBUG"
+PLUGIN_LOG_LEVEL = "INFO"
 _LEVELS = {"DEBUG": 10, "INFO": 20, "ERROR": 40}
 DEFAULT_VOLUME = 55
 DEFAULT_DJ_STYLE = "Speak like a DJ or make a witty comment. Keep it concise. Match your tone to the time of day."
@@ -457,7 +457,7 @@ class RadioPlugin(PluginBase):
             lambda args, states: self._start_radio(RADIO_STATIONS.get(args["station"], {}).get("url"), args["station"], helper),
             "global"
         )
-        helper.register_action("stop_radio", "Stop the radio", {"type":"object","parameters":{}}, lambda args, states: self._stop_radio(), "global")
+        helper.register_action("stop_radio", "Stop the radio", {"type":"object","properties":{}}, lambda args, states: self._stop_radio(), "global")
         helper.register_action(
             "change_radio", "Change to another station",
             {"type": "object", "properties": {"station": {"type": "string", "enum": list(RADIO_STATIONS.keys())}}, "required": ["station"]},
