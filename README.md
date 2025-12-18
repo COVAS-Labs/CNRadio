@@ -52,6 +52,22 @@ Italian talk-show station with a mix of pop, dance, and rock music.
 🔗 https://streamcdnm3-4c4b867c89244861ac216426883d1ad0.msvdn.net/webradio/deejaywfmlinus/live.m3u8  
 Italian station featuring DJ Linus preferred songs from '80 to today.
 
+### Kohina Radio
+🔗 https://player.kohina.com/icecast/stream.opus
+Hand picked chip tunes from classic computers and consoles. SID, Amiga, Atari ST, Arcade, PC, and more!
+
+### Radio CVGM
+🔗 http://radio.cvgm.net:8000/cvgm128
+Video game music station featuring soundtracks from classic and modern games, demo scene and computer music.
+
+### Nectarine Demoscene Radio
+🔗 http://necta.burn.net:8000/nectarine
+Demoscene music station playing tracks from the demoscene community.
+
+### Radio Ericade
+🔗 http://legacy.ericade.net:8000/stream/1/
+Computer and demoscene music.
+
 ---
 
 ## 🗣 Voice Commands
@@ -108,5 +124,7 @@ Examples:
 ---
 
 ## 📚 Release Notes
+
+See [CNRadio v4.0.0 Release Notes](https://github.com/TheDeviceNull/CNRadio/releases/tag/v.4.0.0).
 
 See [CNRadio v3.3.1 Release Notes](https://github.com/TheDeviceNull/CNRadio/releases/tag/v.3.3.1).

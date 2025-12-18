@@ -1,5 +1,7 @@
 # RadioPlugin v4.0.0
 # Covas:NEXT Internet Radio Plugin with DJ-style track announcements
+# - Added new radio stations: Distant Radio 33.05, Pulsar FM, DR Hotline
+# - Added new track retriever for generic MP3 streams, when metadata is not readable directly from VLC
 # -------------------
 # Release 4.0.0 - Dec 2025
 # Pydantic BaseModel for action parameters
@@ -139,6 +141,18 @@ RADIO_STATIONS = {
     "Radio Ericade": {
         "url": "http://legacy.ericade.net:8000/stream/1/",
         "description": "Computer and demoscene music."
+    },
+    "Distant Radio 33.05": {
+        "url": "https://radio.distantworlds3.space/listen/distant_radio/distantradio.mp3",
+        "description": "Interstellar soundwaves through space!\nTunes so good even the vacuum can't stop the beat."
+    },
+    "Pulsar FM": {
+        "url": "https://radio.distantworlds3.space/listen/pulsarfm/pulsarfm.mp3",
+        "description": "Why are we here? Why are you here?\nClassic trance, trance classics pulsing across the galaxy"
+    },
+    "DR Hotline": {
+        "url": "https://radio.distantworlds3.space/listen/hotline/hotline.mp3",
+        "description": "For the blacklight dwellers.\nEverything is Synthetic"
     }
 }
 # ---------------------------------------------------------------------
@@ -274,6 +288,7 @@ class RadioPlugin(PluginBase):
                 )
             ]
         )
+
     # -----------------------------------------------------------------
     # Plugin setup
     # -----------------------------------------------------------------
@@ -348,13 +363,27 @@ class RadioPlugin(PluginBase):
         if not station_name:
             return False
         return "deejay" in station_name.lower()
-    
+    # Static Method for MP3 Stream Detection
+    @staticmethod
+    def is_mp3_stream(station_name: str) -> bool:
+        """Check if a station uses an MP3 stream format."""
+        if not station_name:
+            return False
+        # Check if the station exists in our dictionary
+        if station_name in RADIO_STATIONS:
+            url = RADIO_STATIONS[station_name].get("url", "")
+            # Check if URL ends with .mp3 or contains mp3 in the path
+            url = RADIO_STATIONS[station_name].get("url", "")
+            if (url.endswith('.mp3') or '/mp3' in url) and 'BigFM' not in station_name: # Exclude BigFM which uses mp3 but has its own handling
+                return True
+        return False    
     @staticmethod
     def is_special_station(station_name: str) -> bool:
         """Check if a station requires special handling (SomaFM or Hutton)."""
         return (RadioPlugin.is_somafm_station(station_name) or 
                 RadioPlugin.is_hutton_station(station_name) or 
-                RadioPlugin.is_deejay_station(station_name))
+                RadioPlugin.is_deejay_station(station_name) or
+                RadioPlugin.is_mp3_stream(station_name))
     
     @staticmethod
     def normalize_title(title: str) -> str:
@@ -706,6 +735,11 @@ class RadioPlugin(PluginBase):
         elif self.is_deejay_station(station_name):
             p_log("DEBUG", f"Using Radio Deejay track retriever for {station_name}")
             return deejayretriever.get_deejay_track_info(station_name)
+        elif self.is_mp3_stream(station_name):
+            p_log("DEBUG", f"Using MP3 stream track retriever for {station_name}")
+            url = RADIO_STATIONS[station_name].get("url", "")
+            from . import mp3_stream_track_retriever as mp3retriever
+            return mp3retriever.get_track_info(url)
         else:
             # Use VLC metadata for standard stations
             try:
