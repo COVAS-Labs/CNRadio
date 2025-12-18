@@ -1,35 +1,15 @@
-# RadioPlugin v3.3.3a
+# RadioPlugin v4.0.0
+# Covas:NEXT Internet Radio Plugin with DJ-style track announcements
+# -------------------
+# Release 4.0.0 - Dec 2025
+# Pydantic BaseModel for action parameters
+# Refactored action methods to use Pydantic models
+# Commented out radio_status action to streamline code
 # -------------------
 # Release 3.3.3 - Dec 2025
 # Removed unused radio_status action to streamline code
 # Fixed minor bug in stop_radio action definition type object with empty parameters
 # -------------------
-# Release 3.3.2 - Dec 2025
-# Removed projection system to reduce token usage while maintaining functionality
-# Replaced with in-memory state tracking for current station and track
-# Added new radio stations: Kohina Radio, Radio CVGM, Ericade, Nectarine Demoscene Radio
-# -------------------
-# Release 3.3.1 - Dec 2025
-# Added support for Radio Deejay station with dedicated track retriever.
-# Added BigFM and Radio Capital to pre-installed stations.
-# Fixed minor bugs in track monitoring and logging.
-# -------------------
-# Release 3.3.0 - Dec 2025
-# Key improvements in this release:
-# - Implemented lazy/active monitoring mode: startup announces immediately, then enters
-#   lazy mode (120s checks for SomaFM/Hutton, 90s for others). After 2 unchanged lazy
-#   checks, switches to active mode (30s checks for SomaFM/Hutton, 15s for others) until
-#   a track change is detected, then returns to lazy mode.
-# - Consolidated interval initialization: initial_interval and reduced_interval computed
-#   once at startup and re-evaluated only on station changes (improved efficiency).
-# - Added an 8s delay after user-triggered play/change so the assistant can respond
-#   before the monitor announces the current track.
-# - Suppress duplicate automatic announcements: if the normalized title matches the
-#   last announced title on the same station, automatic announcements are suppressed
-#   (explicit user commands still force a reply).
-# - Robust title normalization using Unicode NFKC + `casefold()` to avoid false
-#   positives from case or Unicode variants.
-# - Improved debug logging and fixed several edge-cases in the startup/check flow.
 
 import vlc
 import threading
@@ -49,10 +29,12 @@ from lib.PluginSettingDefinitions import (
     PluginSettings, SettingsGrid, SelectOption, TextAreaSetting, TextSetting,
     SelectSetting, NumericalSetting, ToggleSetting, ParagraphSetting
 )
+from pydantic.main import BaseModel
+
 # ---------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------
-PLUGIN_LOG_LEVEL = "INFO"
+PLUGIN_LOG_LEVEL = "DEBUG"
 _LEVELS = {"DEBUG": 10, "INFO": 20, "ERROR": 40}
 DEFAULT_VOLUME = 55
 DEFAULT_DJ_STYLE = "Speak like a DJ or make a witty comment. Keep it concise. Match your tone to the time of day."
@@ -67,6 +49,21 @@ MIN_EVENT_INTERVAL = 5  # minimum seconds between track announcements
 GRACE_PERIOD = 1.5  # seconds for projection update grace period
 MIN_TITLE_LENGTH = 3  # minimum length for valid titles
 
+# ---------------------------------------------------------------------
+# Pydantic models for action parameters
+# ---------------------------------------------------------------------
+
+class PlayRadioParameters(BaseModel):
+    station: str
+
+class ChangeRadioParameters(BaseModel):
+    station: str
+
+class SetVolumeParameters(BaseModel):
+    volume: int
+
+class StopRadioParameters(BaseModel):
+    pass
 # ---------------------------------------------------------------------
 # Pre-installed radio stations
 # ---------------------------------------------------------------------
@@ -452,23 +449,32 @@ class RadioPlugin(PluginBase):
     # -----------------------------------------------------------------
     def register_actions(self, helper: PluginHelper):
         helper.register_action(
-            "play_radio", "Play a webradio station",
-            {"type": "object", "properties": {"station": {"type": "string", "enum": list(RADIO_STATIONS.keys())}}, "required": ["station"]},
-            lambda args, states: self._start_radio(RADIO_STATIONS.get(args["station"], {}).get("url"), args["station"], helper),
-            "global"
-        )
-        helper.register_action("stop_radio", "Stop the radio", {"type":"object","properties":{}}, lambda args, states: self._stop_radio(), "global")
-        helper.register_action(
-            "change_radio", "Change to another station",
-            {"type": "object", "properties": {"station": {"type": "string", "enum": list(RADIO_STATIONS.keys())}}, "required": ["station"]},
-            lambda args, states: self._start_radio(RADIO_STATIONS.get(args["station"], {}).get("url"), args["station"], helper),
-            "global"
+            name="play_radio",
+            description=f"Play a webradio station, available stations: {', '.join(RADIO_STATIONS.keys())}",
+            parameters=PlayRadioParameters,
+            method=self.play_radio_action,
+            action_type="global"
         )
         helper.register_action(
-            "set_volume", "Set the radio volume",
-            {"type": "object", "properties": {"volume": {"type": "integer", "minimum": 0, "maximum": 100}}, "required": ["volume"]},
-            lambda args, states: self._set_volume(args["volume"]),
-            "global"
+            name="stop_radio",
+            description="Stop the radio",
+            parameters=StopRadioParameters,
+            method=self.stop_radio_action,
+            action_type="global"
+        )
+        helper.register_action(
+            name="change_radio",
+            description="Change to another station",
+            parameters=ChangeRadioParameters,
+            method=self.change_radio_action,
+            action_type="global"
+        )
+        helper.register_action(
+            name="set_volume",
+            description="Set the radio volume",
+            parameters=SetVolumeParameters,
+            method=self.set_volume_action,
+            action_type="global"
         )
         # Status action: return the current in-memory state for the radio
 #        helper.register_action(
@@ -477,6 +483,28 @@ class RadioPlugin(PluginBase):
 #            lambda args, states: self._radio_status(args, states),
 #            "global"
 #        )
+    # -----------------------------------------------------------------
+    # Action methods
+    # -----------------------------------------------------------------
+    def play_radio_action(self, model: PlayRadioParameters, context: dict) -> str:
+        station_name = model.station
+        station_info = RADIO_STATIONS.get(station_name)
+        if not station_info:
+            return f"Station {station_name} not found."
+        url = station_info['url']
+        return self._start_radio(url, station_name, self.helper)
+    def change_radio_action(self, model: ChangeRadioParameters, context: dict) -> str:
+        station_name = model.station
+        station_info = RADIO_STATIONS.get(station_name)
+        if not station_info:
+            return f"Station {station_name} not found."
+        url = station_info['url']
+        return self._start_radio(url, station_name, self.helper)
+    def set_volume_action(self, model: SetVolumeParameters, context: dict) -> str:
+        volume = model.volume
+        return self._set_volume(volume)
+    def stop_radio_action(self, model: StopRadioParameters, context: dict) -> str:
+        return self._stop_radio()
     # -----------------------------------------------------------------
     # Player control
     # -----------------------------------------------------------------
