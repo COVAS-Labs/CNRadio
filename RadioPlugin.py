@@ -374,7 +374,7 @@ class RadioPlugin(PluginBase):
             url = RADIO_STATIONS[station_name].get("url", "")
             # Check if URL ends with .mp3 or contains mp3 in the path
             url = RADIO_STATIONS[station_name].get("url", "")
-            if (url.endswith('.mp3') or '/mp3' in url) and 'BigFM' not in station_name: # Exclude BigFM which uses mp3 but has its own handling
+            if (url.endswith('.mp3') or '/mp3' in url) and ('BigFM' not in station_name or 'Capital' not in station_name): # Exclude BigFM and Radio Capital which uses mp3 but has its own handling
                 return True
         return False    
     @staticmethod
