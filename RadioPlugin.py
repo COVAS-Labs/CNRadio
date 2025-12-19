@@ -2,6 +2,8 @@
 # Covas:NEXT Internet Radio Plugin with DJ-style track announcements
 # - Added new radio stations: Distant Radio 33.05, Pulsar FM, DR Hotline
 # - Added new track retriever for generic MP3 streams, when metadata is not readable directly from VLC
+# - Removed dj_radio_response_style setting to adhere to what Rude told me: don't mess with event dispatching. The plugin just dispatches events, Covas decides how to respond.
+# If users wants DJ style, they can set it in Covas Character Prompt.
 # -------------------
 # Release 4.0.0 - Dec 2025
 # Pydantic BaseModel for action parameters
@@ -39,14 +41,14 @@ from pydantic.main import BaseModel
 PLUGIN_LOG_LEVEL = "INFO"
 _LEVELS = {"DEBUG": 10, "INFO": 20, "ERROR": 40}
 DEFAULT_VOLUME = 55
-DEFAULT_DJ_STYLE = "Speak like a DJ or make a witty comment. Keep it concise. Match your tone to the time of day."
+
 
 # Monitoring intervals
 LAZY_INTERVAL_STANDARD = 90  # seconds for lazy mode (standard stations)
 LAZY_INTERVAL_SPECIAL = 100  # seconds for lazy mode (SomaFM/Hutton)
 ACTIVE_INTERVAL_STANDARD = 15  # seconds for active mode (standard stations)
 ACTIVE_INTERVAL_SPECIAL = 20 # seconds for active mode (SomaFM/Hutton)
-COMMAND_RESPONSE_DELAY = 8  # seconds to wait after command before announcing
+COMMAND_RESPONSE_DELAY = 10  # seconds to wait after command before announcing
 MIN_EVENT_INTERVAL = 5  # minimum seconds between track announcements
 GRACE_PERIOD = 1.5  # seconds for projection update grace period
 MIN_TITLE_LENGTH = 3  # minimum length for valid titles
@@ -243,7 +245,7 @@ class RadioPlugin(PluginBase):
             "last_updated": 0.0,
             "command_triggered": False
         }
-
+        p_log("DEBUG", f"_radio_state initialized: {self._radio_state}")
         self.settings_config: PluginSettings | None = PluginSettings(
             key="RadioPlugin",
             label="Radio Plugin",
@@ -276,13 +278,6 @@ class RadioPlugin(PluginBase):
                             min_value=0,
                             max_value=100,
                             step=1
-                        ),
-                        TextAreaSetting(
-                            key="dj_response_style",
-                            label="DJ Response Style",
-                            type="textarea",
-                            default_value=DEFAULT_DJ_STYLE,
-                            rows=3
                         )
                     ]
                 )
@@ -305,6 +300,7 @@ class RadioPlugin(PluginBase):
         self.helper = helper
         self.register_actions(helper)
         
+        p_log("DEBUG", "Reply check function registered successfully")
         # Register the radio_changed event
         helper.register_event(
             name="radio_changed",
@@ -469,10 +465,11 @@ class RadioPlugin(PluginBase):
                 raise ValueError(f"Expected list with at least 2 elements, got: {content}")
         except (ValueError, TypeError) as e:
             p_log("ERROR", f"Invalid plugin_event_content format in prompt generator: {event.plugin_event_content}")
-            return "IMPORTANT: React to this radio track change. The track information could not be retrieved."
+            return "React to this radio track change. The track information could not be retrieved."
         
-        dj_style = self.settings.get('dj_response_style', DEFAULT_DJ_STYLE)
-        return f"IMPORTANT: React to this radio track change. New track: '{title}' on station '{station}'. {dj_style}"
+        prompt = f"React to this radio track change. New track: '{title}' on station '{station}'."
+        p_log("DEBUG", f"Generated radio prompt: {prompt}")
+        return prompt
     # -----------------------------------------------------------------
     # Action registration
     # -----------------------------------------------------------------
@@ -505,13 +502,6 @@ class RadioPlugin(PluginBase):
             method=self.set_volume_action,
             action_type="global"
         )
-        # Status action: return the current in-memory state for the radio
-#        helper.register_action(
-#            "radio_status", "Get current radio playback status",
-#            {},
-#            lambda args, states: self._radio_status(args, states),
-#            "global"
-#        )
     # -----------------------------------------------------------------
     # Action methods
     # -----------------------------------------------------------------
@@ -562,11 +552,17 @@ class RadioPlugin(PluginBase):
             self.current_station = station_name
             self.playing = True
             self.stop_monitor.clear()  # Reset the stop event
-        
+            # Reset title repeat count for new station
+            self._title_repeat_count = {}
             # Ensure command_triggered is set to True for both new plays and station changes
             self.monitor_state.command_triggered = True
             self.monitor_state.reset_for_station_change(station_name)
-
+            self._radio_state = {
+                    "current_station": station_name,
+                    "current_title": None,
+                    "last_updated": 0.0,
+                    "command_triggered": True
+                }
             # Create and start a new monitor thread if not already running
             if not self.track_monitor_thread or not self.track_monitor_thread.is_alive():
                 self.track_monitor_thread = threading.Thread(
@@ -596,13 +592,14 @@ class RadioPlugin(PluginBase):
             self.monitor_state.command_triggered = False
             
             # Clear in-memory state
-            self._radio_state.update({
+            self._radio_state ={
                 "current_station": None,
                 "current_title": None,
                 "last_updated": 0.0,
                 "command_triggered": False
-            })
-        
+            }
+            # Reset title repeat count
+            self._title_repeat_count = {}
             # Wait for thread to terminate with timeout
             if self.track_monitor_thread and self.track_monitor_thread.is_alive():
                 self.track_monitor_thread.join(timeout=2)
@@ -638,22 +635,6 @@ class RadioPlugin(PluginBase):
         except Exception as e:
             p_log("ERROR", f"Error setting volume: {e}")
             return f"Error setting volume: {e}"
-#    def _radio_status(self, args=None, states=None):
-#        """Return the current radio playback status from in-memory state."""
-#        try:
-#            station = self._radio_state.get('current_station')
-#            title = self._radio_state.get('current_title')
-#            last_updated_ts = self._radio_state.get('last_updated')
-#            
-#            try:
-#                last_updated = datetime.fromtimestamp(last_updated_ts, timezone.utc).isoformat() if last_updated_ts else 'N/A'
-#            except Exception:
-#                last_updated = str(last_updated_ts)
-
-#            return f"Station: {station or 'N/A'} | Title: {title or 'N/A'} | Last updated: {last_updated}"
-#        except Exception as e:
-#            p_log("ERROR", f"Error reading radio status: {e}")
-#            return f"Error retrieving radio status: {e}"
     # -----------------------------------------------------------------
     # Track monitoring
     # -----------------------------------------------------------------
@@ -668,7 +649,7 @@ class RadioPlugin(PluginBase):
                 if self.stop_monitor.is_set():
                     return
                 time.sleep(1)
-            state.command_triggered = False
+#            state.command_triggered = False # Moved to after first announcement to ensure it's honored
     
         # Initialize state for the current station
         state.reset_for_station_change(self.current_station)
@@ -828,9 +809,6 @@ class RadioPlugin(PluginBase):
                 plugin_event_content=[title, station, command_triggered, time.time()]
             )
         
-            # Temporarily store the current state to restore it after event processing
-            temp_state = self._radio_state.copy()
-        
             # Clear the state to ensure the event is processed
             self._radio_state = {
                 "current_station": None,
@@ -853,6 +831,6 @@ class RadioPlugin(PluginBase):
                 "command_triggered": command_triggered
             })
         
-            p_log("DEBUG", "Event dispatched successfully")
+            p_log("DEBUG", f"Event dispatched successfully. Updated _radio_state: {self._radio_state}")
         except Exception as e:
             p_log("ERROR", f"Error announcing track: {e}")
