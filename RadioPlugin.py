@@ -3,9 +3,8 @@
 # - Added new radio stations: Distant Radio 33.05, Pulsar FM, DR Hotline
 # - Added new track retriever for generic MP3 streams, when metadata is not readable directly from VLC
 # - Removed dj_radio_response_style setting to adhere to what Rude told me: don't mess with event dispatching. The plugin just dispatches events, Covas decides how to respond.
-# If users wants DJ style, they can set it in Covas Character Prompt.
-# -------------------
-# Release 4.0.0 - Dec 2025
+#   If users wants DJ style, they can set it in Covas Character Prompt.
+# - Added enable_announcements action to toggle announcements on/off via actions
 # Pydantic BaseModel for action parameters
 # Refactored action methods to use Pydantic models
 # Commented out radio_status action to streamline code
@@ -41,6 +40,7 @@ from pydantic.main import BaseModel
 PLUGIN_LOG_LEVEL = "INFO"
 _LEVELS = {"DEBUG": 10, "INFO": 20, "ERROR": 40}
 DEFAULT_VOLUME = 55
+ENABLED = True
 
 
 # Monitoring intervals
@@ -68,6 +68,9 @@ class SetVolumeParameters(BaseModel):
 
 class StopRadioParameters(BaseModel):
     pass
+
+class EnableAnnouncementsParameters(BaseModel):
+    enable: bool
 # ---------------------------------------------------------------------
 # Pre-installed radio stations
 # ---------------------------------------------------------------------
@@ -278,6 +281,12 @@ class RadioPlugin(PluginBase):
                             min_value=0,
                             max_value=100,
                             step=1
+                        ),
+                        ToggleSetting(
+                            key="enable_radio_plugin",
+                            label="Enable Radio Plugin Announcements",
+                            type="toggle",
+                            default_value=ENABLED
                         )
                     ]
                 )
@@ -404,7 +413,10 @@ class RadioPlugin(PluginBase):
         except (ValueError, TypeError):
             p_log("ERROR", f"Invalid plugin_event_content format: {event.plugin_event_content}")
             return False
-        
+        # Skip if plugin announcements are disabled
+        if not self.settings.get('enable_radio_plugin', ENABLED):
+            p_log("DEBUG", "Radio plugin announcements are disabled in settings.")
+            return False
         # Skip empty or invalid titles
         if not title or "unknown" in title.lower() or len(title.strip()) < MIN_TITLE_LENGTH:
             p_log("DEBUG", "Ignoring empty or invalid title")
@@ -502,6 +514,13 @@ class RadioPlugin(PluginBase):
             method=self.set_volume_action,
             action_type="global"
         )
+        helper.register_action(
+            name="enable_announcements",
+            description="Enable or disable radio announcements",
+            parameters=EnableAnnouncementsParameters,
+            method=self.enable_announcements_action,
+            action_type="global"
+        )
     # -----------------------------------------------------------------
     # Action methods
     # -----------------------------------------------------------------
@@ -524,6 +543,25 @@ class RadioPlugin(PluginBase):
         return self._set_volume(volume)
     def stop_radio_action(self, model: StopRadioParameters, context: dict) -> str:
         return self._stop_radio()
+    def enable_announcements_action(self, model: EnableAnnouncementsParameters, context: dict) -> str:
+        enable = model.enable
+        self.settings['enable_radio_plugin'] = enable
+        status = "enabled" if enable else "disabled"
+        #Start or stop the monitor thread based on new setting
+        if enable and self.playing and (not self.track_monitor_thread or not self.track_monitor_thread.is_alive()):
+            self.stop_monitor.clear()  # Reset the stop event
+            self.track_monitor_thread = threading.Thread(
+                target=self._monitor_track_changes, 
+                args=(self.helper,),
+                daemon=True  # Make thread daemon so it exits when main thread exits
+            )
+            self.track_monitor_thread.start()
+            p_log("INFO", "Radio plugin announcements enabled; starting track monitor.")
+        elif not enable:
+            self.stop_monitor.set()  # Signal the monitor thread to stop
+            p_log("INFO", "Radio plugin announcements disabled; stopping track monitor.")
+        p_log("INFO", f"Radio plugin announcements have been {status} via action.")
+        return f"Radio plugin announcements have been {status}."
     # -----------------------------------------------------------------
     # Player control
     # -----------------------------------------------------------------
@@ -564,13 +602,16 @@ class RadioPlugin(PluginBase):
                     "command_triggered": True
                 }
             # Create and start a new monitor thread if not already running
-            if not self.track_monitor_thread or not self.track_monitor_thread.is_alive():
-                self.track_monitor_thread = threading.Thread(
-                    target=self._monitor_track_changes, 
-                    args=(helper,),
-                    daemon=True  # Make thread daemon so it exits when main thread exits
-                )
-                self.track_monitor_thread.start()
+            if not self.enable_announcements_action or not self.settings.get('enable_radio_plugin', ENABLED):
+                p_log("INFO", "Radio plugin announcements are disabled; not starting track monitor.")
+            else:
+                if not self.track_monitor_thread or not self.track_monitor_thread.is_alive():
+                    self.track_monitor_thread = threading.Thread(
+                        target=self._monitor_track_changes, 
+                        args=(helper,),
+                        daemon=True  # Make thread daemon so it exits when main thread exits
+                    )
+                    self.track_monitor_thread.start()
     
             p_log("INFO", f"Started playing {station_name} at volume {default_volume}")
             return f"Playing {station_name} at volume {default_volume}"
