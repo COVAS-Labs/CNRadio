@@ -2,71 +2,21 @@
 
 ## 📦 Overview
 
-**RadioPlugin** is an extension for **Covas:NEXT** that lets you listen to and control internet radio stations directly from the assistant interface. It supports voice commands to play, stop, and switch stations, and announces track changes when metadata is available.
+**RadioPlugin** is an extension for **Covas:NEXT** that lets you listen to and control internet radio stations directly from the assistant interface. It supports actions and voice commands to play, stop, switch stations, adjust volume, and optionally announce track changes with a DJ-style tone.  
+Now featuring **Pydantic validation**, **lazy/active track monitoring**, and a **toggle to enable/disable track-change announcements**.
 
 ---
 
 ## 📡 Supported Stations
 
-### Radio Sidewinder  
-🔗 https://radiosidewinder.out.airtime.pro:8000/radiosidewinder_b  
-Fan-made station for *Elite Dangerous* with ambient and techno music, in-game news, and ads.
+Includes a curated list of stations such as:
+- **Elite Dangerous community stations**: Radio Sidewinder, Hutton Orbital Radio
+- **SomaFM channels**: Deep Space One, Groove Salad, Space Station, Secret Agent, Defcon, Lush, Synphaera
+- **Italian stations**: Radio Capital, Radio DeeJay, DeeJay Linetti
+- **Gaming/Demoscene stations**: Kohina Radio, CVGM, Nectarine, Ericade
+- **Others**: BigFM, GalNET Radio
 
-### Hutton Orbital Radio  
-🔗 https://quincy.torontocast.com/hutton  
-Community radio for *Elite Dangerous* with pop, rock, and humorous segments.
-
-### SomaFM Deep Space One  
-🔗 https://ice.somafm.com/deepspaceone  
-Experimental ambient and electronic soundscapes for deep space exploration.
-
-### SomaFM Groove Salad  
-🔗 https://ice.somafm.com/groovesalad  
-Downtempo and chillout mix, ideal for relaxation and creativity.
-
-### SomaFM Space Station  
-🔗 https://ice.somafm.com/spacestation  
-Futuristic electronica, ambient, and experimental tunes.
-
-### SomaFM Secret Agent  
-🔗 https://ice.somafm.com/secretagent  
-Spy-themed lounge and downtempo music for covert operations.
-
-### GalNET Radio  
-🔗 http://listen.radionomy.com/galnet  
-Sci-fi themed station with ambient, rock, and classical music, plus GalNet news.
-
-### BigFM  
-🔗 https://streams.bigfm.de/bigfm-deutschland-128-mp3  
-Popular German hits and chart-toppers for energetic flights.
-
-### Radio Capital  
-🔗 https://playerservices.streamtheworld.com/api/livestream-redirect/CAPITAL.mp3  
-Italian hits and contemporary music for lively journeys.
-
-### Radio DeeJay  
-🔗 https://streamcdnm15-4c4b867c89244861ac216426883d1ad0.msvdn.net/radiodeejay/radiodeejay/master_ma.m3u8  
-Italian talk-show station with a mix of pop, dance, and rock music.
-
-### Radio DeeJay Linetti  
-🔗 https://streamcdnm3-4c4b867c89244861ac216426883d1ad0.msvdn.net/webradio/deejaywfmlinus/live.m3u8  
-Italian station featuring DJ Linus preferred songs from '80 to today.
-
-### Kohina Radio
-🔗 https://player.kohina.com/icecast/stream.opus
-Hand picked chip tunes from classic computers and consoles. SID, Amiga, Atari ST, Arcade, PC, and more!
-
-### Radio CVGM
-🔗 http://radio.cvgm.net:8000/cvgm128
-Video game music station featuring soundtracks from classic and modern games, demo scene and computer music.
-
-### Nectarine Demoscene Radio
-🔗 http://necta.burn.net:8000/nectarine
-Demoscene music station playing tracks from the demoscene community.
-
-### Radio Ericade
-🔗 http://legacy.ericade.net:8000/stream/1/
-Computer and demoscene music.
+*(Full list with URLs is available in the plugin settings UI.)*
 
 ---
 
@@ -78,20 +28,35 @@ Examples:
 - `Stop radio`
 - `Change station to BigFM`
 - `Set volume to 50`
-- `What's playing right now?`
+- `Enable announcements` / `Disable announcements`
+- `What's playing right now?` [with announcements enabled]
 
 ---
 
-## 🔧 Features
 
+## 🔧 Features
 - **Play/Stop/Change Station** via actions and voice commands.
-- **Lazy/Active Track Monitoring**: Starts in lazy mode (long intervals), switches to active mode when titles repeat.
-- **Track Announcements**: Announces current track with duplicate suppression and Unicode normalization.
-- **Playback State Persistence**: Uses `RadioPlaybackProjection` to remember station/title across sessions.
-- **New Action**: `radio_status` to retrieve current playback info.
-- **Volume Control**: Set volume (0–100).
-- **Configuration Panel**: Customize plugin behavior.
-- **Personalized DJ Style**: Configure how the assistant responds to track changes.
+- **Volume Control**: Set playback volume (0–100).
+- **Lazy/Active Track Monitoring**:
+  - Starts in lazy mode (long intervals), switches to active mode when titles repeat.
+- **Track Announcements**:
+  - Announces current track with duplicate suppression and Unicode normalization.
+  - Toggle to enable/disable DJ-style track-change announcements.
+- **Special Station Retrievers**:
+  - Dedicated retrievers for SomaFM, Hutton Orbital, Radio DeeJay, and MP3 streams that VLC cannot parse.
+  - Fallback to VLC metadata for standard stations.
+- **Robust Event Handling**:
+  - Debounced announcements, delayed after commands to avoid overlap.
+- **Safe Threading & Logging**:
+  - Improved concurrency and error handling.
+
+---
+
+## ⚙️ Settings
+In **Settings → Radio Plugin**:
+- **Default Volume**: Initial playback volume.
+- **Track Change Announcements**: Toggle ON/OFF for DJ-style track-change notifications.
+- **Available Stations**: Informational list with descriptions.
 
 ---
 
@@ -105,12 +70,16 @@ Examples:
    ```
 4. Install **VLC media player**.
 5. Restart **Covas:NEXT** and enable the plugin.
+6. [If you're upgrading from previous version]: do a "Clear History" in the "Characters" tab on **Covas:NEXT**
 
 ---
 
 ## ⚙️ Requirements
 
 - `python_vlc >= 3.0.12118`
+- `requests>=2.25.0`
+- `beautifulsoup4>=4.9.3`
+- `urllib3>=1.26.0`
 - **VLC media player** installed on the system.
 
 ---
@@ -118,7 +87,7 @@ Examples:
 ## ⚠️ Migration Notes
 
 - Include `deejay_track_retriever.py` in the plugin folder for DeeJay stations.
-- Requires Covas:NEXT build with **Projection** support.
+- Include `mp3_stream_track_retriever.py` in the plugin folder for generic mp3 stream that use Icy Metadata.
 - No breaking changes for existing settings.
 
 ---
