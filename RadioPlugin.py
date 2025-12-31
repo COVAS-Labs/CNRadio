@@ -1,3 +1,10 @@
+# RadioPlugin v4.0.1
+# Release Notes:
+# -------------------  
+# Volume Persistence Improvement
+# - The plugin now remembers the last set volume level across station changes and restarts.
+# - Corrected volume retrieval timing to ensure accurate volume setting.
+# -------------------
 # RadioPlugin v4.0.0
 # Covas:NEXT Internet Radio Plugin with DJ-style track announcements
 # - Added new radio stations: Distant Radio 33.05, Pulsar FM, DR Hotline
@@ -266,13 +273,6 @@ class RadioPlugin(PluginBase):
                             content="The Radio Plugin lets you listen to internet radio stations while chatting with Covas:NEXT. "
                                     "It plays, stops, switches stations, and adjusts volume. Covas comments on track changes like a DJ."
                         ),
-                        ParagraphSetting(
-                            key="available_stations",
-                            label="Available Stations",
-                            type="paragraph",
-                            readonly=True,
-                            content=self._generate_stations_html()
-                        ),
                         NumericalSetting(
                             key="default_volume",
                             label="Default Volume",
@@ -287,6 +287,13 @@ class RadioPlugin(PluginBase):
                             label="Enable Radio Plugin Announcements",
                             type="toggle",
                             default_value=ENABLED
+                        ),
+                        ParagraphSetting(
+                            key="available_stations",
+                            label="Available Stations",
+                            type="paragraph",
+                            readonly=True,
+                            content=self._generate_stations_html()
                         )
                     ]
                 )
@@ -584,9 +591,11 @@ class RadioPlugin(PluginBase):
     
             self.player = vlc.MediaPlayer(url)
             self.player.play()
-            default_volume = self.settings.get('default_volume', DEFAULT_VOLUME)
-            self.player.audio_set_volume(default_volume)
-
+#            default_volume = self.settings.get('default_volume', DEFAULT_VOLUME)
+#            self.player.audio_set_volume(default_volume)
+            # Set volume to default if self.volume is not set
+            volume = getattr(self, 'volume', self.settings.get('default_volume', DEFAULT_VOLUME))
+            self.player.audio_set_volume(volume)
             self.current_station = station_name
             self.playing = True
             self.stop_monitor.clear()  # Reset the stop event
@@ -613,8 +622,8 @@ class RadioPlugin(PluginBase):
                     )
                     self.track_monitor_thread.start()
     
-            p_log("INFO", f"Started playing {station_name} at volume {default_volume}")
-            return f"Playing {station_name} at volume {default_volume}"
+            p_log("INFO", f"Started playing {station_name} at volume {volume}")
+            return f"Playing {station_name}."
         except Exception as e:
             p_log("ERROR", f"Failed to start radio: {e}")
             return f"Error starting radio: {e}"
@@ -668,8 +677,12 @@ class RadioPlugin(PluginBase):
             if result == -1:
                 p_log("ERROR", "VLC refused volume change (player not ready).")
                 return "Unable to set volume right now."
-
+            # Wait a moment to ensure volume is applied
+            time.sleep(0.2)
             actual = self.player.audio_get_volume()
+            
+            # Store volume in instance for future use
+            self.volume = actual
             p_log("INFO", f"Volume set to {actual} (requested {volume})")
             return f"Volume set to {actual}"
 
